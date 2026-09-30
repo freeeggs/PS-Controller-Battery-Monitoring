@@ -201,7 +201,23 @@ def main() -> int:
         ok = not failed
         msg = "已永久删除" if ok else "部分失败"
     else:
-        ok, msg = send_to_recycle_bin([p for p, _s, _w in targets])
+        # 分批处理（每批最多 BATCH 项），每批后立即复核，避免"一次性提交一大批"
+        # 出问题后无从判断到底哪一项失败。
+        BATCH = 10
+        ok = True
+        msgs = []
+        for start in range(0, len(targets), BATCH):
+            chunk = targets[start:start + BATCH]
+            batch_ok, batch_msg = send_to_recycle_bin([p for p, _s, _w in chunk])
+            got = [p for p, _s, _w in chunk if not os.path.exists(p)]
+            gone = len(got) == len(chunk)
+            msgs.append("第 %d 批（%d 项）：%s，复核 %d/%d 已移走"
+                        % (start // BATCH + 1, len(chunk), batch_msg, len(got),
+                           len(chunk)))
+            ok = ok and batch_ok and gone
+            if not gone:
+                break
+        msg = "；\n".join(msgs)
 
     for path, _size, _why in targets:
         try:
