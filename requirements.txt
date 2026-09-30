@@ -1,0 +1,7 @@
+# 运行依赖（发布版 exe 已内置这些库，普通用户无需安装）
+hidapi>=0.14.0        # PlayStation 手柄 HID 读写（原生扩展，直接读输入报告）
+pystray>=0.19.0       # 系统托盘图标与菜单（Windows 后端基于 Shell_NotifyIcon）
+Pillow>=9.0.0         # 托盘图标绘制与多尺寸 ICO 生成
+
+# 仅构建时需要
+pyinstaller>=6.0      # 打包为单文件 exe
