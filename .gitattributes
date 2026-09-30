@@ -1,0 +1,12 @@
+# 统一换行符，避免 Windows / Linux 之间来回 checkout 时整文件"被修改"
+* text=auto eol=lf
+
+# Windows 脚本必须是 CRLF，否则 cmd / PowerShell 下可能出问题
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制，别做任何转换
+*.ico binary
+*.png binary
+*.exe binary
