@@ -25,7 +25,6 @@ Windows 10 / 11 下的轻量托盘工具：后台读取 **PS4（DualShock 4）/ 
 |---|---|---|
 | DualShock 4 (PS4) | ✅ | ✅ |
 | DualSense (PS5) | ✅ | 未实测 |
-| 第三方兼容手柄 | 尽力支持 | 尽力支持 |
 
 > DS4 蓝牙可能只发不含电量字段的"精简报告"。程序会识别这种情况并提示，仍会尝试切换到
 > 完整报告模式；实在读不到就显示"电量未知"，不会编一个数字。
@@ -55,7 +54,7 @@ PSBatteryTray.exe --version        :: 查看版本
 ## 从源码构建
 
 ```bat
-git clone https://github.com/izolita/PS-Controller-Battery-Monitoring.git
+git clone https://github.com/freeeggs/PS-Controller-Battery-Monitoring
 cd PS-Controller-Battery-Monitoring
 python -m venv .venv && .venv\Scripts\pip install -r requirements.txt
 build\build.ps1

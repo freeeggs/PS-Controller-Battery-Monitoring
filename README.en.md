@@ -32,7 +32,6 @@ Single-file executable — **no install, no admin rights, no Python required.**
 |---|---|---|
 | DualShock 4 (PS4) | ✅ | ✅ |
 | DualSense (PS5) | ✅ | not tested |
-| Third-party compatible pads | best effort | best effort |
 
 > Over Bluetooth a DualShock 4 may only send the short "minimal" report, which by
 > protocol has no battery field. The app detects this, tells you, and tries to
@@ -63,7 +62,7 @@ PSBatteryTray.exe --version        :: print version
 ## Build from source
 
 ```bat
-git clone https://github.com/izolita/PS-Controller-Battery-Monitoring.git
+git clone https://github.com/freeeggs/PS-Controller-Battery-Monitoring
 cd PS-Controller-Battery-Monitoring
 python -m venv .venv && .venv\Scripts\pip install -r requirements.txt
 build\build.ps1
