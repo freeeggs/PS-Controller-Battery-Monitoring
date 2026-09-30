@@ -1,12 +1,20 @@
 # PS 手柄电量监视器 (PSBatteryTray)
 
-Windows 10 64 位下的**轻量级托盘工具**：后台监视 PS4（DualShock 4）与
+**中文** · [English](README.en.md)
+
+Windows 10 / 11 下的**轻量级托盘工具**：后台监视 PS4（DualShock 4）与
 PS5（DualSense）手柄的电池电量，在系统托盘上实时显示，并在电量偏低时通过
 **多通道**提醒用户。
 
 单文件 exe，**无需安装 Python，无需管理员权限**，双击即用。
 
 **当前版本：1.3** · 变更见[版本历史](#版本历史)
+
+![全部状态预览](docs/images/icon-states.png)
+
+> 上图由 `python tools\icon_preview.py` 按**真实托盘尺寸**（16 / 20 / 24 / 32px）
+> 渲染后最近邻放大，含两种风格 × 深色/浅色任务栏底。
+> 两种风格的并排对比见 [docs/images/icon-styles.png](docs/images/icon-styles.png)。
 
 ---
 
