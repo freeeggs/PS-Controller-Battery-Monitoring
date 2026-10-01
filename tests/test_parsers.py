@@ -153,11 +153,38 @@ class DS4ParseTests(unittest.TestCase):
         self.assertIsNone(report.level)
         self.assertIn("无电量字段", report.source)
 
+        # 64B 且报告体被填充（非全零）-> 认定为真正的 USB 完整报告
         long = bytearray(64)
         long[0] = 0x01
+        long[9] = 0x2A          # 数据包计数器
         long[30] = 0x09
         report = parsers.parse_report(FAMILY_DS4, Transport.UNKNOWN, bytes(long))
-        self.assertEqual(report.level, 9)               # 64B -> 完整报告
+        self.assertEqual(report.level, 9)
+
+    def test_unknown_transport_with_padded_minimal_is_not_usb(self):
+        """总线未知时，被补齐的蓝牙精简报告也不能被当成 USB 报告。
+
+        这是本项目明确修过的 bug（接入瞬间误报约 5%）。当初只按
+        ``Transport.BLUETOOTH`` 分支修好了；``Transport.UNKNOWN`` 这条路径
+        曾经仍会把补齐后的 64 字节 0x01 当 USB 报告读下标 30，等于把同一个
+        坑重新引入。这里用真机抓到的原始字节锁死。
+        """
+        report = parsers.parse_report(
+            FAMILY_DS4, Transport.UNKNOWN, self.REAL_BT_MINIMAL_PADDED)
+        self.assertIsNotNone(report)
+        self.assertIsNone(report.level, "不能解析出 0 档")
+        self.assertIsNone(report.percent, "不能报成约 5%")
+        self.assertIn("无电量字段", report.source)
+        self.assertTrue(report.source.startswith(parsers.SRC_DS4_BT_MINIMAL))
+
+    def test_explicit_usb_transport_ignores_shape_check(self):
+        """总线明确是 USB 时，形状检查不介入（以总线为准）。"""
+        data = bytearray(64)
+        data[0] = 0x01
+        data[30] = 0x05         # 报告体全零，但总线确定是 USB
+        report = parsers.parse_report(FAMILY_DS4, Transport.USB, bytes(data))
+        self.assertEqual(report.level, 5)
+        self.assertEqual(report.source, parsers.SRC_DS4_USB)
 
     def test_bt_padded_minimal_does_not_trigger_low_battery_alert(self):
         """端到端锁住原始症状：接入瞬间**不再误报**低电量提醒。

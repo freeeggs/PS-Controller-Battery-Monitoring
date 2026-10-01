@@ -6,12 +6,19 @@ Windows 10 在以下情况会**直接丢弃**普通 Toast / 气泡通知：
 
 * 全屏运行 D3D 游戏（``QUNS_RUNNING_D3D_FULL_SCREEN``）
 * 演示模式（``QUNS_PRESENTATION_MODE``）
-* 专注助手 / 免打扰时段（``QUNS_QUIET_TIME``）
+* 系统静默时段（``QUNS_QUIET_TIME``，指首次登录 / 系统升级后的第一个小时）
 * 锁定屏幕 / 屏保（``QUNS_NOT_PRESENT``）
 
 这些状态下 ``Shell_NotifyIcon(NIF_INFO)`` 不报错，但用户什么都看不到。
 因此本程序除了「尽力发通知」，还会在右下角弹出一个**自绘的置顶窗口**：
-它不经过通知中心、不受专注助手影响，是绕过系统通知抑制的可靠兜底手段。
+它不经过通知中心，是绕过系统通知抑制的可靠兜底手段。
+
+.. note::
+   上面这一组状态来自 ``SHQueryUserNotificationState``。**它检测不到
+   专注助手（Focus Assist）** —— 专注助手不在该 API 的枚举里（早先把
+   ``QUNS_QUIET_TIME`` 当成"专注助手"是错的）。专注助手确实会吞掉气泡
+   通知，但被吞掉时通道 1/2（图标闪烁、提示音）照样触发，提醒不会整个丢失；
+   想让置顶窗口**始终**弹出，把配置 ``alert_popup`` 设为 ``"always"``。
 
 实现要点
 --------

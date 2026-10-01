@@ -329,7 +329,9 @@ def dump_hid(seconds: int = 20) -> int:
     emit("")
     emit("=== 全部 HID 设备 ===")
     all_devices = backend.enumerate_all()
-    for info in all_devices:
+    if all_devices is None:
+        emit("  （枚举失败：hidapi 调用出错，与「没有设备」不是一回事）")
+    for info in all_devices or []:
         emit("  %04X:%04X  %-40s up=%-5s usage=%-4s bus=%-2s  %s" % (
             info.vendor_id, info.product_id, (info.product_string or "")[:40],
             info.usage_page, info.usage, info.bus_type, info.path.decode("utf-8", "replace"),
@@ -337,6 +339,9 @@ def dump_hid(seconds: int = 20) -> int:
     emit("")
     emit("=== 索尼手柄候选 ===")
     candidates = backend.find_playstation_devices()
+    if candidates is None:
+        emit("  （枚举失败，本次结果未知；请稍后重试）")
+        return
     if not candidates:
         emit("  （未发现索尼 HID 设备）")
     for info in candidates:

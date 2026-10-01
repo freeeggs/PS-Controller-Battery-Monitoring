@@ -23,8 +23,22 @@ QUNS_BUSY = 2                       # 全屏应用（非 D3D）或演示中
 QUNS_RUNNING_D3D_FULL_SCREEN = 3    # D3D 独占全屏（游戏）
 QUNS_PRESENTATION_MODE = 4          # 演示模式
 QUNS_ACCEPTS_NOTIFICATIONS = 5      # 可以正常弹通知
-QUNS_QUIET_TIME = 6                 # 专注助手 / 免打扰时段
+QUNS_QUIET_TIME = 6                 # 系统静默时段（首次登录 / 系统升级后的第一小时）
 QUNS_APP = 7                        # 处于 Windows Store 应用内
+
+# ⚠ 关于「专注助手（Focus Assist / 免打扰）」的重要说明
+# --------------------------------------------------------------------------
+# ``SHQueryUserNotificationState`` **不能**用来检测专注助手。它的枚举里没有
+# 这个状态：QUNS_QUIET_TIME 的官方定义是"用户首次登录后的第一个完整小时"
+# （新装系统 / 系统升级后首次登录），与用户在设置里开的专注助手是两件事。
+# 微软文档中该状态的原文是 "indicates that the current user has just started
+# the first full hour after the initial logon"。
+#
+# 因此本模块只回答一个问题：**系统层面现在是否处于会抑制通知的状态**
+# （锁屏 / 全屏 / 演示 / 系统静默时段 / 沉浸式应用）。专注助手不在其列。
+# 提醒为什么仍然可靠？因为提醒本来就不依赖单一通道 —— 气泡被吞掉时，
+# 图标闪烁与提示音照样触发（见 notify/notifier.py 的四通道设计）。
+# 想在任何情况下都弹置顶窗口的用户，把配置里的 alert_popup 设为 "always"。
 
 _QUNS_LABEL = {
     QUNS_NOT_PRESENT: "用户不在（锁屏/屏保/未登录）",
@@ -32,7 +46,7 @@ _QUNS_LABEL = {
     QUNS_RUNNING_D3D_FULL_SCREEN: "全屏游戏（Direct3D）中",
     QUNS_PRESENTATION_MODE: "演示模式",
     QUNS_ACCEPTS_NOTIFICATIONS: "可正常显示通知",
-    QUNS_QUIET_TIME: "专注助手/免打扰时段",
+    QUNS_QUIET_TIME: "系统静默时段（首次登录/升级后的第一小时）",
     QUNS_APP: "Windows 应用全屏中",
 }
 
@@ -56,13 +70,19 @@ def query_notification_state() -> Optional[int]:
 
 
 def notifications_suppressed() -> Tuple[bool, str]:
-    """判断当前是否处于「系统会抑制通知」的状态。
+    """系统层面当前是否会抑制通知，返回 ``(是否被抑制, 原因文本)``。
 
-    返回 ``(是否被抑制, 原因文本)``。
+    .. warning::
+       **这个函数检测不到「专注助手」（Focus Assist）。**
+       ``SHQueryUserNotificationState`` 覆盖的是：锁屏 / 屏保 / 全屏应用 /
+       全屏游戏 / 演示模式 / 系统静默时段（首次登录后一小时）/ 沉浸式应用。
+       专注助手不在这个枚举里（早先把 ``QUNS_QUIET_TIME`` 注释成"专注助手"
+       是错的，官方定义是首次登录/升级后的第一个小时）。
 
-    注意：这里返回的只是**系统层面**的判断（全屏游戏、演示、专注助手等）。
-    Windows 10 的「专注助手」在部分配置下允许「优先级通知」通过，此 API
-    无法区分，所以被抑制时我们并不放弃提醒，而是走替代通道。
+       所以返回值只能说明"系统会不会拦通知"，不能说明"用户是否开了免打扰"。
+       真正的兜底不是更聪明的检测，而是**多通道提醒**：气泡被吞掉时，
+       图标闪烁与提示音照样触发；想在任何情况下都弹置顶窗口的用户，
+       把 ``alert_popup`` 设为 ``"always"`` 即可，不必依赖任何检测。
     """
     state = query_notification_state()
     if state is None:

@@ -16,8 +16,10 @@ Single-file executable — **no install, no admin rights, no Python required.**
   "about 75% (level 7/10)" instead of faking precision.
 - **Multiple controllers** — the icon shows the one with the **lowest** charge.
 - **Low-battery alerts** at 30% / 20% / 10%, sent over **several channels**
-  (toast + icon blink + sound + topmost popup). Windows Focus Assist silently
-  swallows toasts, so relying on them alone means missing the alert.
+  (toast + icon blink + sound + topmost popup). A toast can be silently
+  swallowed (Focus Assist, fullscreen games, presentation mode), so no single
+  channel is trusted — the blink and the sound still fire even if the toast
+  never appears.
 - **Two icon styles** — Windows 10 (square) / Windows 11 (rounded), switchable
   from the right-click menu.
 - **Follows your theme** — dark taskbar → white icon; theme changes are picked up

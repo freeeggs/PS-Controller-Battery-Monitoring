@@ -43,6 +43,11 @@ MAX_TRACKED_DEVICES = 12        # 安全阀：异常情况下也不会无限开�
 OPEN_RETRY_DELAY = 3.0          # 所有集合都打不开时的重试间隔
 READ_ERROR_BACKOFF = 1.0        # 读失败后的退避
 FULL_MODE_DELAY = 3.0           # DS4 蓝牙精简报告 —— 多久后尝试切完整模式
+# 枚举连续失败到这个次数就记 error（设备列表可能过期）。第一次失败只 warning：
+# 单次失败很常见（设备正在枚举中被拔、SetupAPI 瞬时忙），不值得惊动用户。
+DEGRADED_AFTER_FAILURES = 3
+# 多久收不到任何报告就把读数判为过期（只提示、不再显示旧数值）
+STALE_AFTER_SECONDS = 30.0
 
 
 @dataclass
@@ -68,6 +73,17 @@ class ControllerManager:
         self._wake = threading.Event()
         self._scan_thread: Optional[threading.Thread] = None
         self._last_snapshot: List[ControllerView] = []
+        self._scan_failures = 0        # 连续枚举失败次数（见 _scan_once）
+
+    @property
+    def scan_failures(self) -> int:
+        """连续枚举失败次数；达到 :data:`DEGRADED_AFTER_FAILURES` 视为降级。"""
+        return self._scan_failures
+
+    @property
+    def is_scan_degraded(self) -> bool:
+        """枚举连续失败到"设备列表可能过期"的程度（电量读取仍在正常工作）。"""
+        return self._scan_failures >= DEGRADED_AFTER_FAILURES
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -151,6 +167,24 @@ class ControllerManager:
 
     def _scan_once(self) -> None:
         found = backend.find_playstation_devices()
+
+        # 枚举失败 ≠ 没有设备。失败时**本轮不做任何增删**，保留上一轮状态，
+        # 下一周期再试。否则一次临时的 SetupAPI / hidapi 抖动会被当成
+        # "所有手柄同时拔出"：reader 全关、UI 清空、告警去重被重置，
+        # 下一轮又全部重新连上 —— 设备根本没动。
+        if found is None:
+            self._scan_failures += 1
+            if self._scan_failures == 1:
+                log.warning("HID 枚举失败，本轮不做设备增删，保留上一轮状态")
+            elif self._scan_failures == DEGRADED_AFTER_FAILURES:
+                log.error("HID 枚举已连续失败 %d 次：设备列表可能过期"
+                          "（新插入的手柄不会被发现、已拔出的仍会显示），"
+                          "电量读取不受影响", self._scan_failures)
+            return
+        if self._scan_failures:
+            log.info("HID 枚举已恢复（此前连续失败 %d 次）", self._scan_failures)
+            self._scan_failures = 0
+
         present: Dict[str, backend.HidDeviceInfo] = {item.device_key: item for item in found}
 
         with self._lock:
@@ -216,11 +250,21 @@ class ControllerManager:
         record = MutableController(view=view, candidate_paths=[c.path for c in candidates])
         record.opened_ts = time.monotonic()
 
-        reader = _Reader(self, record)
+        # ``supports_battery=False`` 的设备（DS3 / PS Move）只做识别与提示，
+        # **不启动电量读取线程**。不能在"UI 上标个未知"就算完：这些设备在
+        # registry 里记的 family 是 DS4，一旦某条报告恰好 report_id=0x01 且
+        # 长度 ≥31，就会被当成 DS4 报告去读下标 30 —— 那是无意义的位置，
+        # 会读出假电量。约束必须在解析入口，而不是界面提示。
+        reader = _Reader(self, record) if spec.supports_battery else None
         with self._lock:
             self._records[record.view.key] = record
-            self._readers[record.view.key] = reader
-        reader.start()
+            if reader is not None:
+                self._readers[record.view.key] = reader
+        if reader is not None:
+            reader.start()
+        else:
+            log.info("设备 %s 不提供电量数据：仅识别，不启动读取",
+                     view.display_name)
 
         log.info(
             "检测到手柄：%s [%s / %s] 集合候选 %d 个",
@@ -247,24 +291,38 @@ class ControllerManager:
     # 状态更新（由读取线程调用）
     # ------------------------------------------------------------------
     def _update_battery(self, key: str, battery: BatteryReport, raw: bytes,
-                        note: str = "") -> None:
+                        note: Optional[str] = None) -> None:
+        """更新一台手柄的电量与提示。
+
+        :param note: ``None`` = **不动**现有的提示；``""`` = **明确清空**；
+            其它字符串 = 设为该文本。
+
+        .. note::
+           早先的写法是 ``note=note or record.view.note``，于是传 ``""`` 会被
+           ``or`` 吃掉、退化成"保留旧提示" —— 表现是拿到有效完整报告、电量已
+           恢复正常之后，界面上还挂着「蓝牙精简报告模式，无法读取电量」。
+           用 ``None`` / ``""`` 区分"不改"与"清空"才能表达调用方的真实意图。
+        """
         with self._lock:
             record = self._records.get(key)
             if record is None:
                 return
             old = record.view.battery
+            old_note = record.view.note
+            new_note = old_note if note is None else note
             record.last_raw = raw
-            record.view = replace(record.view, battery=battery, note=note or record.view.note)
+            record.view = replace(record.view, battery=battery, note=new_note)
             changed = (
                 old.level != battery.level
                 or old.percent != battery.percent
                 or old.state != battery.state
+                or new_note != old_note        # 只清提示、电量没变时也要推送
             )
         if changed:
             log.info(
-                "电量更新 %s：level=%s percent=%s state=%s source=%s raw=%s",
+                "电量更新 %s：level=%s percent=%s state=%s source=%s note=%r raw=%s",
                 key, battery.level, battery.percent, battery.state.value,
-                battery.source, parsers.hex_dump(raw, 48),
+                battery.source, new_note, parsers.hex_dump(raw, 48),
             )
             self._publish()
 
@@ -466,14 +524,30 @@ class _Reader(threading.Thread):
             )
 
     def _check_stale_battery(self) -> None:
-        """长时间收不到任何报告时提示用户，但不据此判定拔出（由枚举决定）。"""
+        """长时间收不到任何报告时，把**对外读数**切回"未知"。
+
+        只加一句提示而继续显示旧数值是不够的：README 承诺"读不到就说读不到、
+        不残留旧数字"，而"约 85% + 一句警告"仍然是一个**过期读数** ——
+        用户会照着它决定要不要去充电。手柄休眠 / 数据流停止但 HID 集合还在时
+        正好会走到这里。
+
+        最后已知值仍留在 ``record.view`` 之外的内部状态里（日志里能看到），
+        只是不再作为**当前读数**对外展示。数据恢复后 :meth:`_Reader._parse`
+        会用真实报告覆盖，并清掉这条提示。
+        """
         if self.record.last_report_ts == 0.0:
             return
         idle = time.monotonic() - self.record.last_report_ts
-        if idle > 30.0 and not self.record.view.note:
-            self.manager._update_note(  # noqa: SLF001
-                self.record.view.key, "长时间未收到数据（可能已休眠或断开）"
-            )
+        if idle <= STALE_AFTER_SECONDS:
+            return
+        note = "长时间未收到数据（可能已休眠或断开）"
+        current = self.record.view
+        if current.battery.level is None and current.battery.percent is None \
+                and current.note == note:
+            return                     # 已经是"未知 + 本条提示"，不必重复推送
+        self.manager._update_battery(  # noqa: SLF001
+            current.key, UNKNOWN_BATTERY, self.record.last_raw, note=note,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -495,7 +569,19 @@ def _same_views(a: List[ControllerView], b: List[ControllerView]) -> bool:
     return True
 
 
-def _short(key: str) -> str:
+def _short(key) -> str:
+    """把设备路径压成一小段便于看日志。
+
+    ``key`` 既可能是 ``bytes``（hidapi 返回的 path）也可能是 ``str``，
+    两种都要能处理 —— 早先这里写的是 ``"#" in key``，传 bytes 进来会抛
+    ``TypeError: a bytes-like object is required, not 'str'``：
+    "所有集合都打不开"这条**本该只记日志并退避重试**的路径，实际结果是
+    读取线程直接崩掉，那台手柄从此不再被读取。
+    """
+    if isinstance(key, (bytes, bytearray)):
+        key = key.decode("utf-8", "replace")
+    else:
+        key = str(key)
     return key.split("#")[-1][:8] if "#" in key else key[:8]
 
 
