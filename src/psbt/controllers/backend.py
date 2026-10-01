@@ -107,15 +107,28 @@ def _device_instance(path: bytes) -> str:
     return text
 
 
-def enumerate_all() -> List[HidDeviceInfo]:
-    """枚举所有 HID 设备；失败时返回空列表（不抛异常）。"""
+def enumerate_all() -> Optional[List[HidDeviceInfo]]:
+    """枚举所有 HID 设备。
+
+    :returns: 设备列表；**枚举失败时返回 ``None``（而不是空列表）**。
+
+    .. important::
+       ``None`` 与 ``[]`` 是两种完全不同的状态，调用方必须区分：
+
+       * ``[]``   —— 枚举成功，当前确实一台设备都没有
+       * ``None`` —— 这次枚举失败，系统里有什么**未知**
+
+       早先两者都返回 ``[]``，结果一次临时的 SetupAPI / hidapi 抖动会被上层
+       当成"所有手柄都被拔出"：读取线程全关、界面清空、告警去重状态被重置，
+       下一轮又全部重新连上。设备没动，UI 却抖了一轮，还可能破坏告警去重。
+    """
     if _hid is None:
-        return []
+        return None
     try:
         raw = _hid.enumerate()
     except Exception as exc:
         log.debug("hid.enumerate 失败：%s", exc)
-        return []
+        return None
     result: List[HidDeviceInfo] = []
     for d in raw:
         try:
@@ -151,19 +164,26 @@ def _collection_rank(info: HidDeviceInfo) -> int:
     return 8
 
 
-def find_playstation_devices() -> List[HidDeviceInfo]:
+def find_playstation_devices() -> Optional[List[HidDeviceInfo]]:
     """枚举已知的 PS4 / PS5 手柄，并按「最可能是主集合」排序。
 
     返回的列表已按物理设备分组去重：同一手柄只保留最靠前的候选，
     但调用方仍可通过 :func:`candidates_for` 拿到备用集合路径。
+
+    :returns: ``None`` 表示**本轮枚举失败、结果未知**（不是"没有设备"）。
+        调用方**不得**据此判定设备已拔出，详见 :func:`enumerate_all`。
     """
     if _hid is None:
-        return []
+        return None
+
+    found = enumerate_all()
+    if found is None:
+        return None
 
     groups: Dict[str, List[HidDeviceInfo]] = {}
     unknown_sony: List[HidDeviceInfo] = []
 
-    for info in enumerate_all():
+    for info in found:
         if not registry.is_sony(info.vendor_id):
             continue
         spec = registry.lookup(info.vendor_id, info.product_id)
@@ -189,9 +209,13 @@ def candidates_for(infos: List[HidDeviceInfo]) -> List[HidDeviceInfo]:
 
 
 def all_candidates_for(vendor_id: int, product_id: int, device_key: str) -> List[HidDeviceInfo]:
-    """重新枚举并取出指定物理设备的所有可用集合路径（备用候选）。"""
+    """重新枚举并取出指定物理设备的所有可用集合路径（备用候选）。
+
+    枚举失败（``None``）时返回空列表 —— 调用方本来就有"没有候选就退回
+    当前这条"的兜底逻辑，这里不需要区分"失败"与"为空"。
+    """
     infos = [
-        i for i in enumerate_all()
+        i for i in (enumerate_all() or [])
         if i.vendor_id == vendor_id and i.product_id == product_id and i.device_key == device_key
     ]
     return candidates_for(infos)

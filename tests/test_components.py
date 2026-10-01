@@ -14,6 +14,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from psbt import autostart  # noqa: E402
 from psbt import theme  # noqa: E402
+
+#: 注册表测试专用的值名。**绝不能**用 autostart.VALUE_NAME，
+#: 否则会读写用户真实的自启动配置（有 test_test_value_name_is_not_the_real_one 兜底）。
+TEST_VALUE_NAME = "PSBatteryTray__TestOnly"
 from psbt.config import Config  # noqa: E402
 from psbt.controllers.models import (  # noqa: E402
     FAMILY_DS4,
@@ -321,6 +325,16 @@ class ConfigTests(unittest.TestCase):
 
 
 class AutostartTests(unittest.TestCase):
+    """自启动读写测试。
+
+    .. danger::
+       下面几个 test 会**真的读写注册表**，因此一律使用 :data:`TEST_VALUE_NAME`
+       这个一次性值名，并在 finally 里 ``restore_value()`` 精确还原。
+       历史教训：曾经直接用程序自己的值名 ``PSBatteryTray`` 读写用户的
+       ``HKCU\\...\\Run``，还原时又调 ``enable()``（写入当前构建的命令而非原值），
+       于是**跑测试 / 跑 build.ps1 就会把用户的自定义自启动命令覆盖掉**。
+    """
+
     def test_command_contains_program_and_flag(self):
         cmd = autostart.build_command()
         self.assertIn("--autostart", cmd)
@@ -333,31 +347,73 @@ class AutostartTests(unittest.TestCase):
         self.assertTrue(cmd.endswith("--autostart"))
 
     def test_roundtrip_registry(self):
+        """在**专用测试值名**下走一遍真实的注册表读写。
+
+        .. danger::
+           **不要用程序自己的值名去测**。曾经这里用 ``PSBatteryTray`` 直接读写
+           用户的 ``HKCU\\...\\Run``，而还原用的是 ``enable()`` —— 那是"写入当前
+           构建的命令"，不是"恢复原值"，所以用户自定义的自启动命令（旧路径、
+           附加参数）会被静默覆盖。``build.ps1`` 默认会跑测试，等于**每次构建
+           都可能改掉用户的开机启动配置**。
+
+           现在改为：一次性测试值名 + ``restore_value()`` 精确还原。
+        """
         if not autostart.is_available():
             self.skipTest("非 Windows 环境")
-        original = autostart.current_value()
+        original = autostart.current_value(TEST_VALUE_NAME)
         try:
-            self.assertTrue(autostart.enable())
-            self.assertTrue(autostart.is_enabled())
-            self.assertTrue(autostart.points_to_current_build())
-            self.assertTrue(autostart.disable())
-            self.assertFalse(autostart.is_enabled())
+            self.assertTrue(autostart.enable(TEST_VALUE_NAME))
+            self.assertTrue(autostart.is_enabled(TEST_VALUE_NAME))
+            self.assertTrue(autostart.points_to_current_build(TEST_VALUE_NAME))
+            self.assertTrue(autostart.disable(TEST_VALUE_NAME))
+            self.assertFalse(autostart.is_enabled(TEST_VALUE_NAME))
         finally:
-            if original is not None:
-                autostart.enable()
-            else:
-                autostart.disable()
+            autostart.restore_value(original, TEST_VALUE_NAME)
 
     def test_disable_when_absent_is_ok(self):
         if not autostart.is_available():
             self.skipTest("非 Windows 环境")
-        original = autostart.current_value()
+        original = autostart.current_value(TEST_VALUE_NAME)
         try:
-            autostart.disable()
-            self.assertTrue(autostart.disable())
+            autostart.disable(TEST_VALUE_NAME)
+            self.assertTrue(autostart.disable(TEST_VALUE_NAME))
         finally:
-            if original is not None:
-                autostart.enable()
+            autostart.restore_value(original, TEST_VALUE_NAME)
+
+    def test_restore_value_writes_back_exact_text(self):
+        """还原必须是"原样写回"，而不是写成当前构建的命令行。"""
+        if not autostart.is_available():
+            self.skipTest("非 Windows 环境")
+        custom = r'"D:\Old Version\PSBatteryTray.exe" --autostart --debug'
+        original = autostart.current_value(TEST_VALUE_NAME)
+        try:
+            self.assertTrue(autostart.write_raw(custom, TEST_VALUE_NAME))
+            self.assertEqual(autostart.current_value(TEST_VALUE_NAME), custom)
+            self.assertTrue(autostart.enable(TEST_VALUE_NAME))     # 模拟被覆盖
+            self.assertNotEqual(autostart.current_value(TEST_VALUE_NAME), custom)
+            self.assertTrue(autostart.restore_value(custom, TEST_VALUE_NAME))
+            self.assertEqual(autostart.current_value(TEST_VALUE_NAME), custom,
+                             "必须精确还原原始字符串，不能用 enable() 顶替")
+        finally:
+            autostart.restore_value(original, TEST_VALUE_NAME)
+
+    def test_restore_value_none_removes_entry(self):
+        """原来不存在的项，还原后必须仍然不存在。"""
+        if not autostart.is_available():
+            self.skipTest("非 Windows 环境")
+        original = autostart.current_value(TEST_VALUE_NAME)
+        try:
+            autostart.enable(TEST_VALUE_NAME)
+            self.assertTrue(autostart.is_enabled(TEST_VALUE_NAME))
+            self.assertTrue(autostart.restore_value(None, TEST_VALUE_NAME))
+            self.assertFalse(autostart.is_enabled(TEST_VALUE_NAME))
+        finally:
+            autostart.restore_value(original, TEST_VALUE_NAME)
+
+    def test_test_value_name_is_not_the_real_one(self):
+        """护栏：测试值名绝不能等于程序自己的值名，否则又会污染真实配置。"""
+        self.assertNotEqual(TEST_VALUE_NAME, autostart.VALUE_NAME,
+                            "测试必须使用专用值名，不能碰用户真实的自启动项")
 
 
 class SimulatorTests(unittest.TestCase):
@@ -614,6 +670,283 @@ class ThemeFollowTests(unittest.TestCase):
         dark = theme.Theme(taskbar_light=False)
         self.assertEqual(light.icon_color[:3], (26, 26, 26))
         self.assertEqual(dark.icon_color[:3], (255, 255, 255))
+
+
+class StaleBatteryTests(unittest.TestCase):
+    """超过 stale 超时后，旧电量不得继续作为当前读数展示。
+
+    README 承诺"读不到就说读不到、不残留旧数字"。但早先的实现只往 note 里
+    加了一句话，``view.battery`` 原封不动 —— "约 85% + 一句警告"依然是
+    一个过期读数，用户会照着它决定要不要充电。
+    """
+
+    def _reader_with(self, age_seconds, battery=None):
+        import time
+        from psbt.controllers.manager import ControllerManager, _Reader
+        from psbt.controllers.models import (
+            FAMILY_DS4, BatteryReport, ChargeState, ControllerView,
+            MutableController, Transport,
+        )
+
+        manager = ControllerManager(Config())
+        view = ControllerView(
+            key="k1", family=FAMILY_DS4, display_name="DualShock 4",
+            transport=Transport.BLUETOOTH, vendor_id=0x054C, product_id=0x09CC,
+            battery=battery or BatteryReport(8, 85, ChargeState.DISCHARGING, "test"),
+        )
+        record = MutableController(view=view)
+        record.last_report_ts = time.monotonic() - age_seconds
+        manager._records[view.key] = record       # noqa: SLF001
+        return manager, record, _Reader(manager, record)
+
+    def test_old_reading_is_invalidated(self):
+        manager, record, reader = self._reader_with(120.0)
+        reader._check_stale_battery()             # noqa: SLF001
+        self.assertIsNone(record.view.percent,
+                          "超时后不得再展示旧的 85%")
+        self.assertIsNone(record.view.level)
+        self.assertIn("长时间未收到数据", record.view.note)
+
+    def test_fresh_reading_is_kept(self):
+        manager, record, reader = self._reader_with(1.0)
+        reader._check_stale_battery()             # noqa: SLF001
+        self.assertEqual(record.view.percent, 85, "刚收到的读数必须保留")
+        self.assertEqual(record.view.note, "")
+
+    def test_stale_is_not_repeatedly_republished(self):
+        manager, record, reader = self._reader_with(120.0)
+        published = []
+        manager.events.on_snapshot = published.append
+        reader._check_stale_battery()             # noqa: SLF001
+        first = len(published)
+        self.assertGreaterEqual(first, 1)
+        reader._check_stale_battery()             # noqa: SLF001
+        self.assertEqual(len(published), first,
+                         "已是未知+同一提示时不应重复推送")
+
+    def test_valid_report_after_stale_clears_note(self):
+        """数据恢复后必须既恢复读数、又清掉那条提示。"""
+        from psbt.controllers.models import BatteryReport, ChargeState
+
+        manager, record, reader = self._reader_with(120.0)
+        reader._check_stale_battery()             # noqa: SLF001
+        self.assertIn("长时间未收到数据", record.view.note)
+
+        manager._update_battery(                   # noqa: SLF001
+            record.view.key,
+            BatteryReport(6, 65, ChargeState.DISCHARGING, "test"), b"", note="")
+        self.assertEqual(record.view.percent, 65)
+        self.assertEqual(record.view.note, "",
+                         "拿到有效报告后必须能清掉旧提示")
+
+    def test_update_battery_none_keeps_existing_note(self):
+        """note=None 表示"不动提示"，与 note="" 明确区分。"""
+        from psbt.controllers.models import BatteryReport, ChargeState
+
+        manager, record, reader = self._reader_with(120.0)
+        reader._check_stale_battery()             # noqa: SLF001
+        kept = record.view.note
+        manager._update_battery(                   # noqa: SLF001
+            record.view.key,
+            BatteryReport(7, 75, ChargeState.DISCHARGING, "test"), b"")
+        self.assertEqual(record.view.note, kept, "note=None 不应改动提示")
+        self.assertEqual(record.view.percent, 75)
+
+
+class ReaderRobustnessTests(unittest.TestCase):
+    """读取线程的日志辅助函数必须吃得下 hidapi 的 bytes 路径。"""
+
+    def test_short_accepts_bytes_and_str(self):
+        """``_short`` 同时支持 bytes 与 str。
+
+        回归：hidapi 返回的 ``path`` 是 **bytes**，而 ``view.key`` 是 str。
+        早先 ``_short`` 里写的是 ``"#" in key``，传 bytes 进来会抛
+        ``TypeError``；而它在"所有 HID 集合都打不开"这条路径上被调用 ——
+        本该只记一行 debug 日志再退避重试，实际却让读取线程直接崩掉，
+        那台手柄从此不再被读取（设备被 DS4Windows / Steam Input 独占时
+        很容易走到这条路径）。
+        """
+        from psbt.controllers.manager import _short
+
+        self.assertEqual(_short(b"\\\\?\\hid#vid_054c&pid_09cc#7&abc"), "7&abc")
+        self.assertEqual(_short("054C:09CC#7&abc"), "7&abc")
+        self.assertEqual(_short(b"nohashpath"), "nohashpa")
+        self.assertEqual(_short(""), "")
+
+
+class UnsupportedDeviceTests(unittest.TestCase):
+    """``supports_battery=False`` 必须在**解析入口**形成硬约束。
+
+    历史 bug：DS3 / PS Move 在 registry 里 family 记的是 DS4，管理器中却
+    仍然无条件启动读取线程并按 DS4 解析。``supports_battery`` 当时只决定了
+    初始显示"未知" + 一句提示，**并没有阻止报告被解析** —— 一旦某条报告
+    恰好 report_id=0x01 且长度 ≥31，就会去读下标 30 那个无意义的位置，
+    读出假电量。约束放在 UI 提示上是不够的。
+    """
+
+    def _info(self, product_id, name):
+        from psbt.controllers.backend import HidDeviceInfo
+
+        return HidDeviceInfo(
+            path=(r"\\?\hid#vid_054c&pid_%04x#fake" % product_id).encode(),
+            vendor_id=0x054C, product_id=product_id, product_string=name,
+            usage_page=0, usage=0, interface_number=-1, bus_type=1,
+        )
+
+    def test_registry_marks_legacy_devices_as_no_battery(self):
+        from psbt.controllers import registry
+
+        for pid, label in ((0x0268, "DualShock 3"), (0x03D5, "PS Move")):
+            spec = registry.lookup(0x054C, pid)
+            self.assertIsNotNone(spec, label)
+            self.assertFalse(spec.supports_battery, "%s 不应支持电量" % label)
+
+    def test_no_reader_started_for_unsupported_device(self):
+        from psbt.controllers import backend
+        from psbt.controllers.manager import ControllerManager
+
+        info = self._info(0x0268, "DualShock 3")
+        manager = ControllerManager(Config())
+        original = backend.all_candidates_for
+        try:
+            backend.all_candidates_for = lambda *a, **k: []
+            manager._add_device(info)                           # noqa: SLF001
+        finally:
+            backend.all_candidates_for = original
+
+        self.assertIn(info.device_key, manager._records,          # noqa: SLF001
+                      "不支持电量的设备仍应被识别并显示")
+        self.assertNotIn(info.device_key, manager._readers,       # noqa: SLF001
+                         "不得为它启动电量读取线程")
+        note = manager._records[info.device_key].view.note        # noqa: SLF001
+        self.assertIn("不提供电量", note)
+        manager._remove_device(info.device_key)                   # noqa: SLF001
+
+    def test_reader_started_for_supported_device(self):
+        """对照组：支持电量的设备照常启动读取。"""
+        from psbt.controllers import backend
+        from psbt.controllers.manager import ControllerManager
+
+        info = self._info(0x09CC, "DualShock 4 (CUH-ZCT2)")
+        manager = ControllerManager(Config())
+        original = backend.all_candidates_for
+        try:
+            backend.all_candidates_for = lambda *a, **k: []
+            manager._add_device(info)                           # noqa: SLF001
+            self.assertIn(info.device_key, manager._readers)      # noqa: SLF001
+        finally:
+            backend.all_candidates_for = original
+            manager._remove_device(info.device_key)               # noqa: SLF001
+
+
+class ScanFailureTests(unittest.TestCase):
+    """枚举失败必须与「真的没有设备」区分开。
+
+    历史 bug：``enumerate_all()`` 在异常时返回 ``[]``，与"枚举成功但 0 台设备"
+    压成同一个值，于是管理器把一次临时枚举错误当成**所有手柄同时拔出**——
+    关闭读取线程、清空界面、重置告警去重，下一轮又全部重新连上。
+    """
+
+    def _fake_hid(self, behaviour):
+        class _Fake:
+            def __init__(self, fn):
+                self._fn = fn
+
+            def enumerate(self):
+                return self._fn()
+
+            def __getattr__(self, name):        # 其它接口调用一律不关心
+                raise AttributeError(name)
+
+        return _Fake(behaviour)
+
+    def test_enumerate_failure_returns_none(self):
+        from psbt.controllers import backend
+
+        original = backend._hid          # noqa: SLF001
+        try:
+            backend._hid = self._fake_hid(lambda: (_ for _ in ()).throw(OSError("boom")))
+            self.assertIsNone(backend.enumerate_all(),
+                              "枚举失败必须是 None，不能是空列表")
+            self.assertIsNone(backend.find_playstation_devices())
+        finally:
+            backend._hid = original      # noqa: SLF001
+
+    def test_enumerate_success_empty_is_empty_list(self):
+        from psbt.controllers import backend
+
+        original = backend._hid          # noqa: SLF001
+        try:
+            backend._hid = self._fake_hid(lambda: [])
+            self.assertEqual(backend.enumerate_all(), [],
+                             "枚举成功但没有设备应当是空列表")
+            self.assertEqual(backend.find_playstation_devices(), [])
+        finally:
+            backend._hid = original      # noqa: SLF001
+
+    def _manager_with_one_device(self):
+        from psbt.controllers import backend
+        from psbt.controllers.manager import ControllerManager
+        from psbt.controllers.models import (
+            FAMILY_DS4, ControllerView, Transport, MutableController,
+        )
+
+        manager = ControllerManager(Config())
+        view = ControllerView(
+            key="fake-ds4", family=FAMILY_DS4, display_name="DualShock 4 (fake)",
+            transport=Transport.BLUETOOTH, vendor_id=0x054C, product_id=0x09CC,
+        )
+        manager._records[view.key] = MutableController(view=view)   # noqa: SLF001
+        original = backend.find_playstation_devices
+        return manager, original
+
+    def test_scan_failure_does_not_unplug_devices(self):
+        from psbt.controllers import backend
+
+        manager, original = self._manager_with_one_device()
+        try:
+            backend.find_playstation_devices = lambda: None     # 枚举失败
+            manager._scan_once()                                # noqa: SLF001
+            self.assertIn("fake-ds4", manager._records,         # noqa: SLF001
+                          "枚举失败时不得移除已跟踪的设备")
+            self.assertEqual(manager.scan_failures, 1)
+            self.assertFalse(manager.is_scan_degraded)
+
+            for _ in range(3):
+                manager._scan_once()                            # noqa: SLF001
+            self.assertIn("fake-ds4", manager._records)         # noqa: SLF001
+            self.assertTrue(manager.is_scan_degraded,
+                            "连续失败到阈值应标记为降级（设备列表可能过期）")
+        finally:
+            backend.find_playstation_devices = original
+
+    def test_scan_success_still_reconciles(self):
+        """对照组：枚举成功且确实没有设备时，仍然要正常判定为拔出。"""
+        from psbt.controllers import backend
+
+        manager, original = self._manager_with_one_device()
+        try:
+            backend.find_playstation_devices = lambda: []
+            manager._scan_once()                                # noqa: SLF001
+            self.assertNotIn("fake-ds4", manager._records,      # noqa: SLF001
+                             "枚举成功且无设备时才应判定拔出")
+            self.assertEqual(manager.scan_failures, 0)
+        finally:
+            backend.find_playstation_devices = original
+
+    def test_scan_recovery_resets_counter(self):
+        from psbt.controllers import backend
+
+        manager, original = self._manager_with_one_device()
+        try:
+            backend.find_playstation_devices = lambda: None
+            manager._scan_once()                                # noqa: SLF001
+            self.assertEqual(manager.scan_failures, 1)
+            backend.find_playstation_devices = lambda: []
+            manager._scan_once()                                # noqa: SLF001
+            self.assertEqual(manager.scan_failures, 0, "恢复后计数器必须归零")
+        finally:
+            backend.find_playstation_devices = original
 
 
 def _icon_bytes(app):

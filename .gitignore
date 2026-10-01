@@ -67,3 +67,6 @@ htmlcov/
 *~
 Thumbs.db
 Desktop.ini
+
+# PyInstaller 逐次输出目录（历史上曾用过的命名：dist_s4 … dist_s15）
+dist_*/

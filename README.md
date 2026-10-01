@@ -13,7 +13,7 @@ Windows 10 / 11 下的轻量托盘工具：后台读取 **PS4（DualShock 4）/ 
 
 - **真实电量**：手柄只上报 11 档（每档 10%），就按档显示"约 75%（等级 7/10）"，不伪造精度
 - **多手柄显示最低**：接了多台就显示电量最少的那台，先充最该充的
-- **三档低电量提醒**（30% / 20% / 10%）：Toast + 图标闪烁 + 提示音 + 置顶弹窗**多通道**发送 —— Windows 的专注助手会静默吞掉 Toast，只靠它就会漏提醒
+- **三档低电量提醒**（30% / 20% / 10%）：Toast + 图标闪烁 + 提示音 + 置顶弹窗**多通道**发送。专注助手会静默吞掉 Toast，所以提醒不依赖任何一个通道 —— 气泡没弹出来时，图标闪烁与提示音照样生效
 - **两套图标风格**：Windows 10（直角）/ Windows 11（圆角），右键菜单随时切换
 - **跟随系统亮暗主题**：切换后约 2 秒内自动换色
 - **读不到就说读不到**：显示横杠，不残留旧数字；异常值显示"未知"而非 0%，避免误报耗尽
@@ -25,7 +25,6 @@ Windows 10 / 11 下的轻量托盘工具：后台读取 **PS4（DualShock 4）/ 
 |---|---|---|
 | DualShock 4 (PS4) | ✅ | ✅ |
 | DualSense (PS5) | ✅ | 未实测 |
-| 第三方兼容手柄 | 尽力支持 | 尽力支持 |
 
 > DS4 蓝牙可能只发不含电量字段的"精简报告"。程序会识别这种情况并提示，仍会尝试切换到
 > 完整报告模式；实在读不到就显示"电量未知"，不会编一个数字。
@@ -55,7 +54,7 @@ PSBatteryTray.exe --version        :: 查看版本
 ## 从源码构建
 
 ```bat
-git clone https://github.com/izolita/PS-Controller-Battery-Monitoring.git
+git clone https://github.com/freeeggs/PS-Controller-Battery-Monitoring
 cd PS-Controller-Battery-Monitoring
 python -m venv .venv && .venv\Scripts\pip install -r requirements.txt
 build\build.ps1

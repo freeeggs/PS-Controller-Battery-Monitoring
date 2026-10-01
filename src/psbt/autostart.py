@@ -52,13 +52,17 @@ def is_available() -> bool:
     return winreg is not None
 
 
-def current_value() -> Optional[str]:
-    """返回注册表中当前记录的自启动命令行。"""
+def current_value(value_name: str = VALUE_NAME) -> Optional[str]:
+    """返回注册表中当前记录的自启动命令行。
+
+    :param value_name: 值名。默认是本程序自己的项；**测试必须传专用名字**，
+        否则会读到/写到用户真实的自启动配置（详见 tests 里的说明）。
+    """
     if winreg is None:
         return None
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_READ) as key:
-            value, _ = winreg.QueryValueEx(key, VALUE_NAME)
+            value, _ = winreg.QueryValueEx(key, value_name)
             return str(value)
     except FileNotFoundError:
         return None
@@ -67,46 +71,72 @@ def current_value() -> Optional[str]:
         return None
 
 
-def is_enabled() -> bool:
-    return current_value() is not None
+def restore_value(text: Optional[str], value_name: str = VALUE_NAME) -> bool:
+    """把某个值**精确**写回为 ``text``；``text`` 为 ``None`` 表示删除该项。
 
-
-def points_to_current_build() -> bool:
-    """注册表里的路径是否与当前运行的程序一致。"""
-    value = current_value()
-    if not value:
-        return False
-    first = command_line()[0].lower()
-    return first in value.lower()
-
-
-def enable() -> bool:
-    """写入自启动项。成功返回 ``True``。"""
+    这是给"改完了要还原"用的：**不能用 enable() 代替**，因为 enable() 写的是
+    当前构建的命令行，会把用户原来的自定义命令（旧路径、附加参数）永久覆盖掉。
+    """
     if winreg is None:
         return False
-    cmd = build_command()
+    if text is None:
+        return _delete(value_name)
+    return write_raw(text, value_name)
+
+
+def write_raw(text: str, value_name: str = VALUE_NAME) -> bool:
+    """写入一行**原文**命令行（不追加 ``--autostart``）。"""
+    if winreg is None:
+        return False
     try:
         with winreg.CreateKeyEx(
             winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE
         ) as key:
-            winreg.SetValueEx(key, VALUE_NAME, 0, winreg.REG_SZ, cmd)
-        log.info("已开启开机启动：%s = %s", VALUE_NAME, cmd)
+            winreg.SetValueEx(key, value_name, 0, winreg.REG_SZ, str(text))
         return True
     except OSError as exc:
         log.error("写入自启动项失败：%s", exc)
         return False
 
 
-def disable() -> bool:
+def is_enabled(value_name: str = VALUE_NAME) -> bool:
+    return current_value(value_name) is not None
+
+
+def points_to_current_build(value_name: str = VALUE_NAME) -> bool:
+    """注册表里的路径是否与当前运行的程序一致。"""
+    value = current_value(value_name)
+    if not value:
+        return False
+    first = command_line()[0].lower()
+    return first in value.lower()
+
+
+def enable(value_name: str = VALUE_NAME) -> bool:
+    """写入自启动项。成功返回 ``True``。"""
+    if winreg is None:
+        return False
+    cmd = build_command()
+    if not write_raw(cmd, value_name):
+        return False
+    log.info("已开启开机启动：%s = %s", value_name, cmd)
+    return True
+
+
+def disable(value_name: str = VALUE_NAME) -> bool:
     """删除自启动项（不存在也算成功）。"""
+    return _delete(value_name)
+
+
+def _delete(value_name: str) -> bool:
     if winreg is None:
         return False
     try:
         with winreg.OpenKey(
             winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE
         ) as key:
-            winreg.DeleteValue(key, VALUE_NAME)
-        log.info("已关闭开机启动")
+            winreg.DeleteValue(key, value_name)
+        log.info("已关闭开机启动：%s", value_name)
         return True
     except FileNotFoundError:
         return True

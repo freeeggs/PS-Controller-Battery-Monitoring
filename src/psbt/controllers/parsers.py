@@ -273,6 +273,22 @@ def _minimal_report(buf: bytes) -> BatteryReport:
     )
 
 
+def _looks_like_padded_minimal(buf: bytes) -> bool:
+    """报告是不是「蓝牙精简报告被补齐到 64 字节」。
+
+    只在**无法判定连接方式**时用作保险。判据：第 10 字节往后全是 0。
+
+    真机证据（DS4 CUH-ZCT2 蓝牙接入瞬间的第一条报告）::
+
+        01 78 7A 7C 84 08 00 00 00 00 ... 00     (64B，下标 30 是填充的 0x00)
+
+    精简报告只有前 10 字节有意义（摇杆 + 按键），补齐部分必然是 0；
+    而真正的 USB 完整报告里，偏移 9 起是数据包计数器、12 起是陀螺仪/加速度计，
+    这些字段**不可能**整段为 0。
+    """
+    return len(buf) >= 11 and not any(buf[10:])
+
+
 def _parse_ds4(transport: Transport, report_id: int, buf: bytes,
                source_hint: str) -> Optional[BatteryReport]:
     """解析 DualShock 4 输入报告。
@@ -305,7 +321,17 @@ def _parse_ds4(transport: Transport, report_id: int, buf: bytes,
         return None
 
     # USB（或无法判定连接方式）：0x01 是完整报告，电量在下标 30
+    #
+    # 连接方式为 UNKNOWN 时多一道保险：报告体若为空（第 10 字节起全 0），
+    # 按蓝牙精简报告处理。原因见 _looks_like_padded_minimal 的注释 ——
+    # 蓝牙栈会把 10 字节精简报告补齐到 64 字节，只看 ID 和长度会读出假的 5%。
     if report_id == DS4_REPORT_USB and size >= _DS4_MIN_LEN_USB:
+        if transport == Transport.UNKNOWN and _looks_like_padded_minimal(buf):
+            # 总线未知时的保险：这条报告体是空的，极可能就是蓝牙精简报告被
+            # 补齐到 64 字节。宁可显示"电量未知"，也不能再次踩到本项目已经
+            # 明确修过的"读下标 30 得到假的 0 档 / 约 5%"。
+            # （返回的 source 会标成精简报告，日志里一眼能看出来。）
+            return _minimal_report(buf)
         report = interpret_ds4(buf[DS4_USB_BATTERY_INDEX])
         return _with_source(report, SRC_DS4_USB, buf, source_hint)
     # 个别蓝牙栈会把 bus_type 报成 USB；此时只能靠长度兜底区分 0x01 的两种含义
