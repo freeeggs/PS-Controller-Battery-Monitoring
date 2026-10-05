@@ -74,15 +74,21 @@ class HidDeviceInfo:
 
     @property
     def device_key(self) -> str:
-        """同一物理设备的所有集合共用一个 key。
+        """同一物理设备的所有集合共用一个 key；**同一手柄跨总线也用同一个 key**。
 
-        优先用**父 USB 设备**的实例 ID（见 :mod:`physid`）：复合设备会把一个
-        手柄暴露成多个接口，各接口的 HID 实例段互不相同，只按 HID 路径分组
-        会把**一个手柄显示成好几台**（一台有电量、其余"电量未知"）。
+        优先级：
 
-        拿不到物理设备（蓝牙连接、cfgmgr32 不可用）时回退到 HID 实例段 ——
-        与旧行为一致，不会更差。
+        1. **手柄自己的 MAC**（见 :func:`controller_mac`）—— 唯一能跨总线对齐的
+           标识。手柄蓝牙连着时插上 USB 线，Windows 会同时暴露两条设备，
+           只有 MAC 相同才能认出"这是同一只手柄"，从而不显示成两条。
+        2. 父 USB 设备的实例 ID（见 :mod:`physid`）—— 复合设备会把一个手柄
+           暴露成多个接口，各接口的 HID 实例段互不相同，只按 HID 路径分组
+           会把**一个手柄显示成好几台**。
+        3. HID 实例段 —— 都拿不到时的兜底，与旧行为一致。
         """
+        mac = controller_mac(self)
+        if mac:
+            return "%04X:%04X#MAC:%s" % (self.vendor_id, self.product_id, mac)
         anchor = physid.physical_device_id(self.path) or _device_instance(self.path)
         return "%04X:%04X#%s" % (self.vendor_id, self.product_id, anchor)
 
@@ -212,9 +218,22 @@ def find_playstation_devices() -> Optional[List[HidDeviceInfo]]:
     return result
 
 
+def _transport_rank(info: HidDeviceInfo) -> int:
+    """同一条手柄同时出现在多个总线上时，**优先用 USB**。
+
+    手柄蓝牙连着时插上 USB 线，Windows 会同时暴露 USB 与蓝牙两条设备、
+    两条都能开。如果排序不确定，每轮扫描都可能认为"HID 路径变了"并重启
+    读取线程 —— 界面会跟着抖。所以这里给一个确定性的偏好：USB 优先
+    （有线链路更稳、无需请求完整报告模式）。蓝牙那条仍会留在候选列表里，
+    USB 打不开时会自动回落（见 :func:`all_candidates_for`）。
+    """
+    return 0 if info.transport == Transport.USB else 1
+
+
 def candidates_for(infos: List[HidDeviceInfo]) -> List[HidDeviceInfo]:
     """把同一物理设备的多个集合排好序，最优的候选排最前。"""
-    return sorted(infos, key=lambda i: (_collection_rank(i), i.usage_page, i.usage))
+    return sorted(infos, key=lambda i: (_transport_rank(i), _collection_rank(i),
+                                        i.usage_page, i.usage))
 
 
 def is_controller_collection(info: HidDeviceInfo) -> bool:
@@ -396,6 +415,68 @@ def request_ds4_full_report_mode(handle: HidHandle, transport: Transport) -> boo
 def dualsense_firmware_info(handle: HidHandle) -> Optional[bytes]:
     """读取 DualSense 固件信息（0x20，64 字节）—— 仅用于排障日志。"""
     return handle.get_feature_report(0x20, 64)
+
+
+# ---------------------------------------------------------------------------
+# 手柄自己的 MAC：跨总线识别"同一台手柄"
+# ---------------------------------------------------------------------------
+# 为什么需要：手柄**蓝牙连着时插上 USB 线**，Windows 会同时暴露两条 HID 设备
+# （蓝牙一条、USB 一条），两者的分组键天然不同 → 界面里同一只手柄出现两条。
+# 能跨总线对齐的只有手柄自己的 MAC。
+#
+# 两条来源（内核 hid-playstation.c 就是这么做的）：
+#   * 蓝牙：设备唯一串，对应 hidapi 的 serial_number，本身就是 MAC；
+#   * USB ：serial_number 常常是空的，得读**配对信息特性报告**
+#           （DualSense = 0x09 / DualShock 4 = 0x12），MAC 在小端序的 [1..6]。
+#
+# 真机验证（DualSense，USB 与蓝牙同时连着）：
+#   特性报告 0x09 = 09 4E B3 82 56 27 0C ...  → 反转 → 0c275682b34e
+#   蓝牙侧 serial_number = '0c275682b34e'              一致 ✓
+
+_mac_cache: Dict[bytes, Optional[str]] = {}
+_MAC_MISS = object()
+
+
+def controller_mac(info: HidDeviceInfo) -> Optional[str]:
+    """返回手柄自己的 MAC（12 位小写十六进制），拿不到返回 ``None``。
+
+    优先用 ``serial_number``（蓝牙连接时就是 MAC）；拿不到就打开设备读一次
+    配对信息特性报告。**结果按设备路径缓存** —— 一条路径只读一次，
+    重插会换路径、缓存自然失效。
+    """
+    key = info.path
+    cached = _mac_cache.get(key, _MAC_MISS)
+    if cached is not _MAC_MISS:
+        return cached                                  # type: ignore[return-value]
+
+    mac = physid.normalize_mac(info.serial)
+    if mac is None and info.product_id in physid.PAIRING_REPORT:
+        report_id, length = physid.PAIRING_REPORT[info.product_id]
+        payload = None
+        handle = HidHandle(info)
+        try:
+            if handle.open():
+                payload = handle.get_feature_report(report_id, length)
+        except Exception as exc:                       # 读不到不算错误，只是没标识
+            log.debug("读取配对信息特性报告失败（%s）：%s", info, exc)
+        finally:
+            try:
+                handle.close()
+            except Exception:
+                pass
+        mac = physid.mac_from_feature_report(payload)
+        if mac:
+            log.debug("从特性报告 0x%02X 取到手柄 MAC：%s", report_id, mac)
+
+    if len(_mac_cache) > 64:                           # 防止无界增长
+        _mac_cache.clear()
+    _mac_cache[key] = mac
+    return mac
+
+
+def clear_mac_cache() -> None:
+    """清空 MAC 缓存（测试用）。"""
+    _mac_cache.clear()
 
 
 # ---------------------------------------------------------------------------

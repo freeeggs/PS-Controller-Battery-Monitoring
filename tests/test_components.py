@@ -868,7 +868,7 @@ class CompositeDeviceTests(unittest.TestCase):
             physid.hid_instance_id(self.REAL_PATHS[1][0]),
             r"HID\VID_054C&PID_0CE6&MI_04&Col01\9&6a2d811&0&0000")
         self.assertEqual(
-            physid.hid_instance_id(b"\\?\HID#VID_054C&PID_09CC#7&abc&0&0000#{g}"),
+            physid.hid_instance_id(rb"\\?\HID#VID_054C&PID_09CC#7&abc&0&0000#{g}"),
             "HID\\VID_054C&PID_09CC\\7&abc&0&0000")
         self.assertIsNone(physid.hid_instance_id("not-a-hid-path"))
         self.assertIsNone(physid.hid_instance_id(b""))
@@ -904,6 +904,180 @@ class CompositeDeviceTests(unittest.TestCase):
         self.assertFalse(physid._is_usb_node(r"BTHLE\DEV_1234\7&a&0&0000"))   # noqa: SLF001
         self.assertTrue(physid._is_usb_node(                      # noqa: SLF001
             r"USB\VID_8087&PID_0026\5&1&0&1"))
+
+
+class SameControllerTwoTransportsTests(unittest.TestCase):
+    """同一只手柄同时出现在两个总线上，只能显示一条。
+
+    真机场景（用户反馈）：手柄**蓝牙连着时插上 USB 线**，Windows 会同时暴露
+    两条 HID 设备，两条都能打开——
+
+    .. code-block:: text
+
+       12:54:54  检测到手柄：DualSense [蓝牙 / 054C:0CE6#\\?\\HID]
+       12:55:01  检测到手柄：DualSense [USB / 054C:0CE6#USB\\VID_054C&PID_0CE6\\6&1B0A3985&0&2]
+
+    ——界面里同一只手柄出现两条。两条的分组键天然不同，能跨总线对齐它们的
+    只有**手柄自己的 MAC**：蓝牙侧 hidapi 的 ``serial_number`` 就是 MAC，
+    USB 侧 ``serial_number`` 是空的、得读配对信息特性报告。
+
+    下面的字节都是真机抓到的原样数据（DualSense，USB 与蓝牙同时连着）。
+    """
+
+    #: 真机特性报告 0x09（USB 侧读到的，MAC 小端序存在 [1..6]）
+    REAL_PAIRING = bytes.fromhex("09 4E B3 82 56 27 0C 08 25 00 DA 47 64 28 AF 44 00 00 00 00")
+    #: 蓝牙侧 hidapi 给的 serial_number
+    REAL_BT_SERIAL = "0c275682b34e"
+    #: USB 侧真实路径（serial 为空）
+    USB_PATH = (r"\\?\HID#VID_054C&PID_0CE6&MI_03#8&e44178f&0&0000"
+                r"#{4d1e55b2-f16f-11cf-88cb-001111000030}").encode()
+    #: 蓝牙侧真实路径
+    BT_PATH = (r"\\?\HID#{00001124-0000-1000-8000-00805f9b34fb}"
+               r"_VID&0002054c_PID&0ce6#9&1934ba94&1&0000"
+               r"#{4d1e55b2-f16f-11cf-88cb-001111000030}").encode()
+
+    def setUp(self):
+        from psbt.controllers import backend
+
+        self.backend = backend
+        # 保存原对象：下面的替身会覆盖模块级名字，必须还原，
+        # 否则会污染后面的测试（读取线程会拿到不会 read 的假句柄）。
+        self._orig_handle = backend.HidHandle
+        backend.clear_mac_cache()
+
+    def tearDown(self):
+        self.backend.HidHandle = self._orig_handle
+        self.backend.clear_mac_cache()
+
+    def _info(self, path, bus_type, serial=""):
+        from psbt.controllers.backend import HidDeviceInfo
+
+        return HidDeviceInfo(
+            path=path, vendor_id=0x054C, product_id=0x0CE6,
+            product_string="DualSense Wireless Controller",
+            serial=serial, usage_page=1, usage=5, interface_number=-1,
+            bus_type=bus_type)
+
+    def _stub_feature_reads(self):
+        """把打开设备/读特性报告换成返回真机字节，测试不碰硬件。"""
+        payload = self.REAL_PAIRING
+        opened = []
+
+        class _FakeHandle:
+            def __init__(self, info):
+                self.info = info
+
+            def open(self):
+                opened.append(self.info.path)
+                return True
+
+            def get_feature_report(self, report_id, length=64):
+                return payload if report_id == 0x09 else None
+
+            def close(self):
+                pass
+
+        self.backend.HidHandle = _FakeHandle
+        return opened
+
+    # ---- 纯函数 ----------------------------------------------------------
+    def test_normalize_mac_variants(self):
+        from psbt.controllers import physid
+
+        for text in ("0c275682b34e", "0C275682B34E", "0c:27:56:82:b3:4e",
+                     "0C-27-56-82-B3-4E", "  0c275682b34e  "):
+            self.assertEqual(physid.normalize_mac(text), "0c275682b34e", text)
+        for bad in ("", None, "0c275682b3", "not-a-mac", "0c275682b34e00"):
+            self.assertIsNone(physid.normalize_mac(bad), bad)
+
+    def test_mac_from_feature_report_is_little_endian(self):
+        """特性报告里的 MAC 是**小端序**，必须反过来读。
+
+        内核结构体注释：``u8 mac_address[6]; /* Note: stored in little
+        endian order. */`` —— 真机字节 4E B3 82 56 27 0C 对应
+        0C:27:56:82:B3:4E。
+        """
+        from psbt.controllers import physid
+
+        self.assertEqual(physid.mac_from_feature_report(self.REAL_PAIRING),
+                         "0c275682b34e")
+        self.assertIsNone(physid.mac_from_feature_report(b""))
+        self.assertIsNone(physid.mac_from_feature_report(b"\x09\x01\x02"))
+
+    # ---- 采集 MAC --------------------------------------------------------
+    def test_mac_from_bluetooth_serial(self):
+        info = self._info(self.BT_PATH, bus_type=2, serial=self.REAL_BT_SERIAL)
+        self.assertEqual(self.backend.controller_mac(info), "0c275682b34e")
+
+    def test_mac_from_usb_feature_report(self):
+        """USB 侧 serial 为空，靠特性报告取 MAC。"""
+        self._stub_feature_reads()
+        info = self._info(self.USB_PATH, bus_type=1, serial="")
+        self.assertEqual(self.backend.controller_mac(info), "0c275682b34e")
+
+    def test_mac_read_is_cached_per_path(self):
+        opened = self._stub_feature_reads()
+        info = self._info(self.USB_PATH, bus_type=1, serial="")
+        self.backend.controller_mac(info)
+        self.backend.controller_mac(info)
+        self.assertEqual(len(opened), 1, "同一条路径只该读一次")
+
+    # ---- ★ 核心：两条总线必须归成一台 -----------------------------------
+    def test_usb_and_bt_share_one_device_key(self):
+        """★ 用户报的 bug：蓝牙 + USB 同时连着，界面出现两条。
+
+        两个集合的分组键必须相同 —— 这正是界面只显示一条的关键。
+        """
+        self._stub_feature_reads()
+        usb = self._info(self.USB_PATH, bus_type=1, serial="")
+        bt = self._info(self.BT_PATH, bus_type=2, serial=self.REAL_BT_SERIAL)
+        self.assertEqual(usb.device_key, bt.device_key,
+                         "同一只手柄的两条总线必须共用一个 device_key")
+        self.assertIn("MAC:0c275682b34e", usb.device_key)
+
+    def test_different_controllers_are_not_merged(self):
+        """护栏：两只**不同**的手柄不能被并成一台。"""
+        payload = bytearray(self.REAL_PAIRING)
+        payload[1:7] = bytes.fromhex("11 22 33 44 55 66")      # 另一台手柄
+        self._stub_feature_reads()
+        self.backend.HidHandle.get_feature_report = (
+            lambda self_, rid, length=64: bytes(payload) if rid == 0x09 else None)
+        a = self._info(self.USB_PATH, bus_type=1, serial="")
+        b = self._info(self.BT_PATH, bus_type=2, serial="aabbccddeeff")
+        self.assertNotEqual(a.device_key, b.device_key)
+
+    def test_falls_back_when_mac_unavailable(self):
+        """MAC 取不到时退回原来的分组方式，不能崩、也不能变成同一台。"""
+        class _DeadHandle:
+            def __init__(self, info):
+                pass
+
+            def open(self):
+                return False
+
+            def close(self):
+                pass
+
+        self.backend.HidHandle = _DeadHandle
+        usb = self._info(self.USB_PATH, bus_type=1, serial="")
+        bt = self._info(self.BT_PATH, bus_type=2, serial="")
+        self.assertIsNone(self.backend.controller_mac(usb))
+        self.assertIsNone(self.backend.controller_mac(bt))
+        self.assertNotEqual(usb.device_key, bt.device_key)
+        self.assertNotIn("MAC:", usb.device_key)
+
+    def test_usb_is_preferred_over_bluetooth(self):
+        """同一台手柄两条总线都在时，候选必须**确定性地** USB 优先。
+
+        否则每轮扫描都可能认为"HID 路径变了"并重启读取线程，界面会抖。
+        """
+        self._stub_feature_reads()
+        usb = self._info(self.USB_PATH, bus_type=1, serial="")
+        bt = self._info(self.BT_PATH, bus_type=2, serial=self.REAL_BT_SERIAL)
+        for order in ([usb, bt], [bt, usb]):          # 两种输入顺序结果一致
+            picked = self.backend.controller_candidates(order)
+            self.assertEqual(picked[0].transport.label, "USB")
+            self.assertEqual(len(picked), 2, "蓝牙那条要留作兜底")
 
 
 class ReaderRobustnessTests(unittest.TestCase):

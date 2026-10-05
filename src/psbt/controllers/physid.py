@@ -181,3 +181,62 @@ def physical_device_id(path) -> Optional[str]:
 def clear_cache() -> None:
     """清空缓存（测试用；或设备拓扑大改后调用）。"""
     _cache.clear()
+
+
+# ===========================================================================
+# 手柄自己的 MAC：跨总线（USB / 蓝牙）识别"同一台手柄"
+# ===========================================================================
+# 需求：手柄蓝牙连着时插上 USB 线，Windows 会**同时**暴露两条 HID 设备
+# （蓝牙一条、USB 一条），分组键不同 → 界面里同一只手柄出现两条。
+#
+# 能跨总线对齐两者的只有**手柄自己的 MAC**。内核 hid-playstation.c 就是这么
+# 拿的，两条来源：
+#
+#   if (hdev->bus == BUS_USB) {
+#           DUALSHOCK4_GET_REPORT(0x12, buf, 16);
+#           memcpy(mac, &buf[1], 6);          /* 特性报告里 */
+#   } else {
+#           sscanf(hdev->uniq, "%02hhx:%02hhx:...");   /* 蓝牙：设备唯一串 */
+#   }
+#
+# 真机验证（DualSense，USB 与蓝牙同时连着）：
+#   特性报告 0x09 = 09 4E B3 82 56 27 0C 08 25 ...
+#   → 反转（内核注明是小端） = 0C 27 56 82 B3 4E
+#   → 蓝牙侧 hidapi.serial_number = '0c275682b34e'   完全一致 ✓
+#   → 设备树实例 BTHENUM\DEV_0C275682B34E            完全一致 ✓
+
+#: 家族 -> (配对信息特性报告 ID, 读取长度)
+PAIRING_REPORT = {
+    0x0CE6: (0x09, 20),      # DualSense
+    0x0DF2: (0x09, 20),      # DualSense Edge
+    0x05C4: (0x12, 16),      # DualShock 4 (CUH-ZCT1)
+    0x09CC: (0x12, 16),      # DualShock 4 (CUH-ZCT2)
+}
+
+
+def normalize_mac(text) -> Optional[str]:
+    """把各种写法归一成 12 位小写十六进制：``0c275682b34e``。
+
+    接受 ``0c:27:56:82:b3:4e`` / ``0C-27-56-82-B3-4E`` / ``0C275682B34E``。
+    不是 12 位十六进制就返回 ``None``（例如空串 —— Windows 上 USB 连接的
+    手柄 serial_number 常常是空的，那正是需要读特性报告的原因）。
+    """
+    if not text:
+        return None
+    digits = "".join(c for c in str(text).lower() if c in "0123456789abcdef")
+    return digits if len(digits) == 12 else None
+
+
+def mac_from_feature_report(payload: Optional[bytes]) -> Optional[str]:
+    """从配对信息特性报告里取出 MAC。
+
+    **MAC 在报告里是小端序**（内核结构体注释：``stored in little endian order``），
+    所以要倒着读。真机字节::
+
+        09 4E B3 82 56 27 0C 08 25 00 ...
+        ^^ 报告 ID
+           ^^^^^^^^^^^^^^^ 倒序 -> 0c275682b34e
+    """
+    if not payload or len(payload) < 7:
+        return None
+    return "".join("%02x" % b for b in reversed(payload[1:7]))

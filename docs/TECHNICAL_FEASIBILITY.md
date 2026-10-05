@@ -5,7 +5,7 @@
 > 档位（每档 10%），拿不到 1% 精度；② Windows 10 的"专注助手/游戏模式"会
 > 抑制 Toast 通知，因此低电量提醒必须走多通道兜底。
 
-- 文档版本：1.6
+- 文档版本：1.7
 - 验证环境：Windows 10 64 位（本机）、Python 3.13.14、hidapi 0.15.0
 - 协议依据：Linux 内核 `drivers/hid/hid-playstation.c`、`hid-ids.h`
 
