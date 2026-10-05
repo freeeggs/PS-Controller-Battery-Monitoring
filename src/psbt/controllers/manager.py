@@ -243,28 +243,17 @@ class ControllerManager:
             vendor_id=info.vendor_id,
             product_id=info.product_id,
             serial=info.serial,
-            battery=UNKNOWN_BATTERY if spec.supports_battery else BatteryReport(),
+            battery=UNKNOWN_BATTERY,
             connected=True,
-            note="" if spec.supports_battery else "该型号不提供电量数据",
         )
         record = MutableController(view=view, candidate_paths=[c.path for c in candidates])
         record.opened_ts = time.monotonic()
 
-        # ``supports_battery=False`` 的设备（DS3 / PS Move）只做识别与提示，
-        # **不启动电量读取线程**。不能在"UI 上标个未知"就算完：这些设备在
-        # registry 里记的 family 是 DS4，一旦某条报告恰好 report_id=0x01 且
-        # 长度 ≥31，就会被当成 DS4 报告去读下标 30 —— 那是无意义的位置，
-        # 会读出假电量。约束必须在解析入口，而不是界面提示。
-        reader = _Reader(self, record) if spec.supports_battery else None
+        reader = _Reader(self, record)
         with self._lock:
             self._records[record.view.key] = record
-            if reader is not None:
-                self._readers[record.view.key] = reader
-        if reader is not None:
-            reader.start()
-        else:
-            log.info("设备 %s 不提供电量数据：仅识别，不启动读取",
-                     view.display_name)
+            self._readers[record.view.key] = reader
+        reader.start()
 
         log.info(
             "检测到手柄：%s [%s / %s] 集合候选 %d 个",

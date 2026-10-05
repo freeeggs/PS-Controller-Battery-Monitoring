@@ -5,7 +5,7 @@
 > 档位（每档 10%），拿不到 1% 精度；② Windows 10 的"专注助手/游戏模式"会
 > 抑制 Toast 通知，因此低电量提醒必须走多通道兜底。
 
-- 文档版本：1.5
+- 文档版本：1.6
 - 验证环境：Windows 10 64 位（本机）、Python 3.13.14、hidapi 0.15.0
 - 协议依据：Linux 内核 `drivers/hid/hid-playstation.c`、`hid-ids.h`
 
@@ -99,19 +99,21 @@ bit 4-7  CHARGING_STATUS    (GENMASK(7,4))  充电状态
 
 ### 2.5 已识别的设备 VID / PID
 
-索尼 Vendor ID 固定为 `0x054C`。
+索尼 Vendor ID 固定为 `0x054C`。**只收录 PS4 / PS5 手柄本体。**
 
-| PID | 设备 | 家族 | 有无电量 |
-|---|---|---|---|
-| `0x05C4` | DualShock 4 (CUH-ZCT1) | DS4 | 有 |
-| `0x09CC` | DualShock 4 (CUH-ZCT2) | DS4 | 有 |
-| `0x0BA0` | DualShock 4 无线适配器 (CUH-ZWA1) | DS4 | 有（原样转发 DS4 报告） |
-| `0x0CE6` | DualSense (PS5) | DualSense | 有 |
-| `0x0DF2` | DualSense Edge (PS5) | DualSense | 有 |
-| `0x0268` | DualShock 3 (PS3) | — | **无**，标注为不支持 |
-| `0x03D5` | PS Move 控制器 | — | **无**，标注为不支持 |
+| PID | 设备 | 家族 |
+|---|---|---|
+| `0x05C4` | DualShock 4 (CUH-ZCT1) | DS4 |
+| `0x09CC` | DualShock 4 (CUH-ZCT2) | DS4 |
+| `0x0CE6` | DualSense (PS5) | DualSense |
+| `0x0DF2` | DualSense Edge (PS5) | DualSense |
 
-后两项显式列入"识别但无电量"，避免用户接上后看到空白而误以为程序失效。
+> **1.6 起移除**：`0x0268` DualShock 3、`0x03D5` PS Move 控制器、
+> `0x0BA0` 官方无线适配器 (CUH-ZWA1)。
+> 前两者的 HID 协议里**根本没有电量字段**，收录进来只能显示"未知"，
+> 对用户没有价值；适配器已停产、手头无硬件可验证。移除后连同代码里
+> 那套"识别但不读电量"的分支（`supports_battery`）一并删掉了。
+> 这些设备现在完全不会被识别，不会出现在界面里。
 
 ---
 

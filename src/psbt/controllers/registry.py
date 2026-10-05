@@ -22,23 +22,20 @@ SONY_VENDOR_ID = 0x054C
 class DeviceSpec:
     family: str
     name: str
-    # DS4 用 0x01(USB)/0x11(BT)，DualSense 用 0x01(USB)/0x31(BT)
-    supports_battery: bool = True
 
 
+# 只收录 PS4 / PS5 手柄本体。
+# 曾经还收录过 PS3 的 DualShock 3、PS Move、以及 PS4 官方无线适配器
+# （CUH-ZWA1, 0x0BA0）—— 前两者协议里根本没有电量字段（只能识别不能读），
+# 适配器已停产且我们手头没有硬件可验证。1.6 起一并移除，代码里那套
+# "识别但不读电量"的分支也随之删掉。
 KNOWN_DEVICES: Dict[Tuple[int, int], DeviceSpec] = {
-    # ---- DualShock 4 ----
+    # ---- DualShock 4 (PS4) ----
     (SONY_VENDOR_ID, 0x05C4): DeviceSpec(FAMILY_DS4, "DualShock 4 (CUH-ZCT1)"),
     (SONY_VENDOR_ID, 0x09CC): DeviceSpec(FAMILY_DS4, "DualShock 4 (CUH-ZCT2)"),
-    # 索尼官方 DS4 无线适配器（CUH-ZWA1）。它把 DS4 的 HID 报告原样转发给系统，
-    # 在设备管理器里表现为一个 HID 游戏控制器，可以按 DS4 解析。
-    (SONY_VENDOR_ID, 0x0BA0): DeviceSpec(FAMILY_DS4, "DualShock 4 无线适配器 (CUH-ZWA1)"),
-    # ---- DualSense ----
+    # ---- DualSense (PS5) ----
     (SONY_VENDOR_ID, 0x0CE6): DeviceSpec(FAMILY_DUALSENSE, "DualSense (PS5)"),
     (SONY_VENDOR_ID, 0x0DF2): DeviceSpec(FAMILY_DUALSENSE, "DualSense Edge (PS5)"),
-    # 以下是 PS3 / PS Move 等老设备，能识别但**不提供电量**，单独标注避免误报。
-    (SONY_VENDOR_ID, 0x0268): DeviceSpec(FAMILY_DS4, "DualShock 3 (PS3)", supports_battery=False),
-    (SONY_VENDOR_ID, 0x03D5): DeviceSpec(FAMILY_DS4, "PS Move 控制器", supports_battery=False),
 }
 
 # 关键报告 ID / 大小常量（对照 hid-playstation.c）

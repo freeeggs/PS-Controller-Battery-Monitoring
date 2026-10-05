@@ -869,7 +869,7 @@ class CompositeDeviceTests(unittest.TestCase):
             r"HID\VID_054C&PID_0CE6&MI_04&Col01\9&6a2d811&0&0000")
         self.assertEqual(
             physid.hid_instance_id(b"\\?\HID#VID_054C&PID_09CC#7&abc&0&0000#{g}"),
-            r"HID\VID_054C&PID_09CC\7&abc&0&0000")
+            "HID\\VID_054C&PID_09CC\\7&abc&0&0000")
         self.assertIsNone(physid.hid_instance_id("not-a-hid-path"))
         self.assertIsNone(physid.hid_instance_id(b""))
 
@@ -928,14 +928,22 @@ class ReaderRobustnessTests(unittest.TestCase):
 
 
 class UnsupportedDeviceTests(unittest.TestCase):
-    """``supports_battery=False`` 必须在**解析入口**形成硬约束。
+    """只支持 PS4 / PS5 手柄**本体**。
 
-    历史 bug：DS3 / PS Move 在 registry 里 family 记的是 DS4，管理器中却
-    仍然无条件启动读取线程并按 DS4 解析。``supports_battery`` 当时只决定了
-    初始显示"未知" + 一句提示，**并没有阻止报告被解析** —— 一旦某条报告
-    恰好 report_id=0x01 且长度 ≥31，就会去读下标 30 那个无意义的位置，
-    读出假电量。约束放在 UI 提示上是不够的。
+    1.6 起移除了三类设备：PS3 的 DualShock 3、PS Move、以及 PS4 官方无线
+    适配器 (CUH-ZWA1)。前两者协议里根本没有电量字段（只能识别不能读），
+    适配器已停产且手头没有硬件可验证。
+
+    移除后，"识别但不读电量"那套分支（``supports_battery``）也随之删掉了，
+    所以这些 PID 现在**完全不会被识别**，不会出现在界面里。
     """
+
+    #: 明确不支持的设备（PID -> 说明）
+    REMOVED = (
+        (0x0268, "DualShock 3 (PS3)"),
+        (0x03D5, "PS Move 控制器"),
+        (0x0BA0, "DualShock 4 无线适配器 (CUH-ZWA1)"),
+    )
 
     def _info(self, product_id, name):
         from psbt.controllers.backend import HidDeviceInfo
@@ -943,40 +951,47 @@ class UnsupportedDeviceTests(unittest.TestCase):
         return HidDeviceInfo(
             path=(r"\\?\hid#vid_054c&pid_%04x#fake" % product_id).encode(),
             vendor_id=0x054C, product_id=product_id, product_string=name,
-            usage_page=0, usage=0, interface_number=-1, bus_type=1,
+            usage_page=1, usage=5, interface_number=-1, bus_type=1,
         )
 
-    def test_registry_marks_legacy_devices_as_no_battery(self):
+    def test_registry_only_knows_ps4_and_ps5_controllers(self):
         from psbt.controllers import registry
 
-        for pid, label in ((0x0268, "DualShock 3"), (0x03D5, "PS Move")):
-            spec = registry.lookup(0x054C, pid)
-            self.assertIsNotNone(spec, label)
-            self.assertFalse(spec.supports_battery, "%s 不应支持电量" % label)
+        known = {pid for (_vid, pid) in registry.known_pairs()}
+        self.assertEqual(known, {0x05C4, 0x09CC, 0x0CE6, 0x0DF2},
+                         "只应保留 PS4/PS5 手柄本体")
 
-    def test_no_reader_started_for_unsupported_device(self):
+    def test_removed_devices_are_not_recognized(self):
+        from psbt.controllers import registry
+
+        for pid, label in self.REMOVED:
+            self.assertIsNone(registry.lookup(0x054C, pid),
+                              "%s 不应再被收录" % label)
+
+    def test_removed_device_is_not_tracked(self):
+        """不在表里的设备连识别都不会识别 —— 不进记录、不开线程。"""
         from psbt.controllers import backend
         from psbt.controllers.manager import ControllerManager
 
-        info = self._info(0x0268, "DualShock 3")
-        manager = ControllerManager(Config())
-        original = backend.all_candidates_for
-        try:
-            backend.all_candidates_for = lambda *a, **k: []
-            manager._add_device(info)                           # noqa: SLF001
-        finally:
-            backend.all_candidates_for = original
+        for pid, label in self.REMOVED:
+            info = self._info(pid, label)
+            manager = ControllerManager(Config())
+            manager._add_device(info)                             # noqa: SLF001
+            self.assertNotIn(info.device_key, manager._records,   # noqa: SLF001
+                             "%s 不应被跟踪" % label)
+            self.assertNotIn(info.device_key, manager._readers,   # noqa: SLF001
+                             "%s 不应启动读取线程" % label)
 
-        self.assertIn(info.device_key, manager._records,          # noqa: SLF001
-                      "不支持电量的设备仍应被识别并显示")
-        self.assertNotIn(info.device_key, manager._readers,       # noqa: SLF001
-                         "不得为它启动电量读取线程")
-        note = manager._records[info.device_key].view.note        # noqa: SLF001
-        self.assertIn("不提供电量", note)
-        manager._remove_device(info.device_key)                   # noqa: SLF001
+    def test_no_dead_supports_battery_field(self):
+        """护栏：那个已经没人用的 `supports_battery` 字段不该偷偷回来。"""
+        from psbt.controllers import registry
+
+        spec = registry.lookup(0x054C, 0x0CE6)
+        self.assertFalse(hasattr(spec, "supports_battery"),
+                         "字段已随设备精简一并删除")
 
     def test_reader_started_for_supported_device(self):
-        """对照组：支持电量的设备照常启动读取。"""
+        """对照：支持电量的设备照常启动读取。"""
         from psbt.controllers import backend
         from psbt.controllers.manager import ControllerManager
 

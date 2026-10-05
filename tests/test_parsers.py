@@ -24,8 +24,18 @@ from psbt.controllers.models import (  # noqa: E402
 
 
 def make_report(report_id: int, size: int, index: int, value: int) -> bytes:
+    """构造一条**像真实完整报告**的输入报告。
+
+    .. note::
+       不能只填电量字节就交差：真实报告的陀螺仪/时间戳区（下标 12 起）必然
+       有数据，而"除了头部和电量字节以外全 0"恰好是**连接/断开瞬间空壳报告**
+       的特征，会被解析层正确拒绝（见 ``parsers._body_is_empty``）。
+       这里填一段递增数据，让合成报告具备真实报告的形态。
+    """
     buf = bytearray(size)
     buf[0] = report_id
+    for i in range(12, min(size, 24)):
+        buf[i] = (0x40 + i) & 0xFF          # 模拟陀螺仪/时间戳
     buf[index] = value
     return bytes(buf)
 
@@ -177,11 +187,12 @@ class DS4ParseTests(unittest.TestCase):
         self.assertIn("无电量字段", report.source)
         self.assertTrue(report.source.startswith(parsers.SRC_DS4_BT_MINIMAL))
 
-    def test_explicit_usb_transport_ignores_shape_check(self):
-        """总线明确是 USB 时，形状检查不介入（以总线为准）。"""
+    def test_explicit_usb_transport_with_populated_body_parses(self):
+        """总线明确是 USB、报告体也有数据 → 正常解析。"""
         data = bytearray(64)
         data[0] = 0x01
-        data[30] = 0x05         # 报告体全零，但总线确定是 USB
+        data[12] = 0x99           # 陀螺仪/时间戳区非零 = 真实报告
+        data[30] = 0x05
         report = parsers.parse_report(FAMILY_DS4, Transport.USB, bytes(data))
         self.assertEqual(report.level, 5)
         self.assertEqual(report.source, parsers.SRC_DS4_USB)
@@ -286,6 +297,103 @@ class PercentConversionTests(unittest.TestCase):
         self.assertLess(parsers.level_to_percent(1), 20)
         self.assertGreaterEqual(parsers.level_to_percent(2), 20)
         self.assertLess(parsers.level_to_percent(0), 10)
+
+
+class StubReportTests(unittest.TestCase):
+    """"空壳" 0x01 报告：看着合法、其实读不出电量，绝不能报成 5%。
+
+    字节全部**原样抄自真机日志**（日志只 dump 前 48 字节，其余补 0；
+    反正这些报告的后半部分本来就是 0）。三份日志、三次误报，同一个坑：
+
+    * 2026-10-05 12:36:25  DualSense 蓝牙接入 → 误报 critical（用户报的）
+    * 2026-10-04 23:26:10  DualSense USB      → 误报（用户报的"断开时"）
+    * 2026-09-21 21:0x     DS4 蓝牙精简报告被补齐 → 误报
+    """
+
+    #: DualSense 蓝牙接入瞬间（raw=01 80 80 83 7D 08 00 10 00 ...）
+    DS_STUB_BT = bytes.fromhex(
+        "01 80 80 83 7D 08 00 10 00 00 00 00 00 00 00 00"
+        "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"
+        "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"
+        "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00")
+
+    #: DualSense 走 USB 收到的空壳（raw=01 7F 7F 7F 7F 00 00 00 08 00 ...）
+    DS_STUB_USB = bytes.fromhex(
+        "01 7F 7F 7F 7F 00 00 00 08 00 00 00 00 00 00 00"
+        "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"
+        "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"
+        "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00")
+
+    #: DualSense 正常 USB 报告（raw=01 7F 80 7F 7C 00 00 01 08 00 00 00 99 ...）。
+    #: 日志只 dump 前 48 字节，电量下标 53 按其当时读出的 level=7 补 0x07
+    #: （DS5 电量字节的低 4 位才是等级，高 4 位是充电状态）。
+    DS_REAL_USB = bytes.fromhex(
+        "01 7F 80 7F 7C 00 00 01 08 00 00 00 99 6E 92 8E"
+        "00 00 00 00 FF FF 0D 00 A3 1F 63 04 85 68 47 AA"
+        "04 80 00 00 00 80 00 00 00 00 09 09 00 00 00 00"
+        "00 00 00 00 00 07 00 00 00 00 00 00 00 00 00 00")
+
+    def test_fixtures_have_battery_at_index_53(self):
+        self.assertEqual(len(self.DS_STUB_BT), 64)
+        self.assertEqual(len(self.DS_REAL_USB), 64)
+        self.assertEqual(self.DS_STUB_BT[53], 0x00)
+        self.assertEqual(self.DS_REAL_USB[53], 0x07, "真报告电量字节")
+
+    def test_dualsense_bt_stub_is_not_a_reading(self):
+        report = parsers.parse_report(
+            FAMILY_DUALSENSE, Transport.BLUETOOTH, self.DS_STUB_BT)
+        self.assertIsNotNone(report)
+        self.assertIsNone(report.level, "不能读出 0 档")
+        self.assertIsNone(report.percent, "不能报成约 5%")
+
+    def test_dualsense_usb_stub_is_not_a_reading(self):
+        """★ 用户报的"断开连接时误报 5%"：USB 上也会收到空壳。"""
+        report = parsers.parse_report(
+            FAMILY_DUALSENSE, Transport.USB, self.DS_STUB_USB)
+        self.assertIsNotNone(report)
+        self.assertIsNone(report.level)
+        self.assertIsNone(report.percent)
+
+    def test_dualsense_real_usb_report_still_parses(self):
+        """对照：真报告必须照常读出电量（不能因为加闸把正常工作也挡了）。"""
+        report = parsers.parse_report(
+            FAMILY_DUALSENSE, Transport.USB, self.DS_REAL_USB)
+        self.assertEqual(report.level, 7)
+        self.assertEqual(report.percent, 75)
+        self.assertEqual(report.source, parsers.SRC_DS_USB)
+
+    def test_ds4_usb_stub_is_not_a_reading(self):
+        """DS4 在 USB 上收到空壳同样不可信。"""
+        report = parsers.parse_report(FAMILY_DS4, Transport.USB, self.DS_STUB_USB)
+        self.assertIsNone(report.level)
+        self.assertIsNone(report.percent)
+
+    def test_no_stub_triggers_a_low_battery_alert(self):
+        """端到端锁住症状：三种空壳都不得触发低电量提醒。
+
+        这是用户实际感受到的问题（"误报一个 5%"= 弹出严重低电量提醒）。
+        """
+        from psbt.controllers.models import ControllerView
+        from psbt.notify.policy import LowBatteryPolicy
+
+        policy = LowBatteryPolicy([30, 20, 10])
+        cases = [
+            (FAMILY_DUALSENSE, Transport.BLUETOOTH, self.DS_STUB_BT, 0x0CE6),
+            (FAMILY_DUALSENSE, Transport.USB, self.DS_STUB_USB, 0x0CE6),
+            (FAMILY_DS4, Transport.USB, self.DS_STUB_USB, 0x09CC),
+            (FAMILY_DS4, Transport.BLUETOOTH, self.DS_STUB_BT, 0x09CC),
+            (FAMILY_DS4, Transport.UNKNOWN, self.DS_STUB_USB, 0x09CC),
+        ]
+        for family, transport, buf, pid in cases:
+            report = parsers.parse_report(family, transport, buf)
+            view = ControllerView(
+                key="k", family=family, display_name="C", transport=transport,
+                vendor_id=0x054C, product_id=pid, battery=report)
+            self.assertIsNone(
+                policy.evaluate(view),
+                "空壳报告不得触发提醒：%s/%s" % (family, transport.label))
+            self.assertIsNone(view.percent,
+                              "图标也不应显示百分比：%s/%s" % (family, transport.label))
 
 
 class ProtocolDocTests(unittest.TestCase):
