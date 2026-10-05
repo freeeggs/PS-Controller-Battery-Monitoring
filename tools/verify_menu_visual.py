@@ -89,7 +89,8 @@ def chevron_pos():
     return (0, 0)
 
 
-def views():
+def demo_views():
+    """**假数据**，用于看菜单排版（与真实设备无关）。"""
     return [
         ControllerView(key="a", family=FAMILY_DUALSENSE, display_name="DualSense (PS5)",
                        transport=Transport.BLUETOOTH, vendor_id=0x054C, product_id=0x0CE6,
@@ -100,18 +101,65 @@ def views():
     ]
 
 
-def main() -> int:
-    out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "artifacts", "tray_menu.png")
+class _RealViews:
+    """接**真实设备**：起一个真 Manager，等它出快照，然后读它的 snapshot。
+
+    用途：验证界面里到底列出了几台手柄（例如"复合设备是否把一个手柄
+    显示成好几台"）。用假数据是看不出这类问题的。
+    """
+
+    def __init__(self):
+        from psbt.controllers.manager import ControllerManager
+
+        self.manager = ControllerManager(Config())
+        self.views = []
+        self.manager.events.on_snapshot = self._on_snapshot
+
+    def _on_snapshot(self, views):
+        self.views = list(views)
+
+    def start(self) -> bool:
+        return self.manager.start()
+
+    def wait(self, seconds: float) -> None:
+        import time as _t
+
+        deadline = _t.monotonic() + seconds
+        while _t.monotonic() < deadline and not self.views:
+            _t.sleep(0.2)
+
+    def stop(self) -> None:
+        self.manager.stop()
+
+    def __call__(self):
+        return self.views
+
+
+def main() -> int:                                    # noqa: C901
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    use_real = "--real" in sys.argv
+    out = args[0] if args else os.path.join(ROOT, "artifacts", "tray_menu.png")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     setup_logging("INFO", console=True)
 
-    tray = TrayApp(Config(), TrayCallbacks(get_views=views))
+    real = _RealViews() if use_real else None
+    if real is not None:
+        if not real.start():
+            print("hidapi 不可用，无法使用 --real 模式")
+            return 2
+        real.wait(8.0)
+        print("真实设备快照：%d 台" % len(real.views))
+        for v in real.views:
+            print("   %s" % v.menu_text())
+
+    source = real if real is not None else demo_views
+    tray = TrayApp(Config(), TrayCallbacks(get_views=source))
 
     def work():
         from PIL import ImageGrab
 
         try:
-            tray.update(views())
+            tray.update(source())
             time.sleep(1.0)
 
             # 直接把「右键」消息投递给托盘窗口 —— 这正是 shell 在用户右键图标时
@@ -163,6 +211,8 @@ def main() -> int:
             tray.stop()
 
     tray.run(setup=work)
+    if real is not None:
+        real.stop()
     return 0
 
 

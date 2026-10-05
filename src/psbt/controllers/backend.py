@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from ..logs import get_logger
-from . import registry
+from . import physid, registry
 from .models import Transport
 
 log = get_logger("hid")
@@ -74,8 +74,17 @@ class HidDeviceInfo:
 
     @property
     def device_key(self) -> str:
-        """同一物理设备的所有集合共用一个 key。"""
-        return "%04X:%04X#%s" % (self.vendor_id, self.product_id, _device_instance(self.path))
+        """同一物理设备的所有集合共用一个 key。
+
+        优先用**父 USB 设备**的实例 ID（见 :mod:`physid`）：复合设备会把一个
+        手柄暴露成多个接口，各接口的 HID 实例段互不相同，只按 HID 路径分组
+        会把**一个手柄显示成好几台**（一台有电量、其余"电量未知"）。
+
+        拿不到物理设备（蓝牙连接、cfgmgr32 不可用）时回退到 HID 实例段 ——
+        与旧行为一致，不会更差。
+        """
+        anchor = physid.physical_device_id(self.path) or _device_instance(self.path)
+        return "%04X:%04X#%s" % (self.vendor_id, self.product_id, anchor)
 
     def __str__(self) -> str:
         return "%s (%04X:%04X %s up=%s u=%s bus=%s)" % (
@@ -198,7 +207,7 @@ def find_playstation_devices() -> Optional[List[HidDeviceInfo]]:
 
     result: List[HidDeviceInfo] = []
     for key in sorted(groups):
-        candidates = candidates_for(groups[key])
+        candidates = controller_candidates(groups[key])
         result.append(candidates[0])
     return result
 
@@ -206,6 +215,37 @@ def find_playstation_devices() -> Optional[List[HidDeviceInfo]]:
 def candidates_for(infos: List[HidDeviceInfo]) -> List[HidDeviceInfo]:
     """把同一物理设备的多个集合排好序，最优的候选排最前。"""
     return sorted(infos, key=lambda i: (_collection_rank(i), i.usage_page, i.usage))
+
+
+def is_controller_collection(info: HidDeviceInfo) -> bool:
+    """这个 HID 集合有可能**是游戏手柄**吗。
+
+    用的是**黑名单**（只排除"确定不是手柄"的集合），不是白名单 —— 错杀会让
+    一台正常手柄从界面上整个消失，代价远大于多留一个可疑集合（后者由
+    :func:`_collection_rank` 排序处理，主集合仍然排最前）。
+
+    要排除的是触控板附带的集合。真机实测 DualSense 走 USB 适配器时::
+
+        up=1  u=5   Game Pad           ← 主集合，保留
+        up=1  u=6   Keyboard           ← 排除
+        up=12 u=1   Consumer Control   ← 排除
+        up=1  u=2   Mouse              ← 排除
+
+    注意**不能**用白名单（只认 Game Pad）：蓝牙连接的 DS4 报的是
+    ``up=0 u=0``（hidapi 没能给出 usage），白名单会把它一起筛掉。
+    """
+    if info.usage_page == 0x01:                      # Generic Desktop
+        # Pointer / Mouse / Keyboard / Keypad 确定不是游戏手柄
+        return info.usage not in (0x01, 0x02, 0x06, 0x07)
+    if info.usage_page in (0x0B, 0x0C):              # Telephony / Consumer
+        return False
+    return True                                      # 其余（含 up=0 的未知）放行
+
+
+def controller_candidates(infos: List[HidDeviceInfo]) -> List[HidDeviceInfo]:
+    """优先挑"像手柄"的集合；**一个都不像时宁可不筛**（不能把设备弄丢）。"""
+    picked = [i for i in infos if is_controller_collection(i)]
+    return candidates_for(picked or infos)
 
 
 def all_candidates_for(vendor_id: int, product_id: int, device_key: str) -> List[HidDeviceInfo]:
@@ -218,7 +258,9 @@ def all_candidates_for(vendor_id: int, product_id: int, device_key: str) -> List
         i for i in (enumerate_all() or [])
         if i.vendor_id == vendor_id and i.product_id == product_id and i.device_key == device_key
     ]
-    return candidates_for(infos)
+    # 备用候选同样只取"像手柄"的集合：触控板的键鼠集合即使能打开也读不到电量，
+    # 让主集合失败后回落到它们只会得到无意义的读数。
+    return controller_candidates(infos)
 
 
 # ---------------------------------------------------------------------------

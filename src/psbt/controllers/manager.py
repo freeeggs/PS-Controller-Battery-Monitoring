@@ -577,12 +577,20 @@ def _short(key) -> str:
     ``TypeError: a bytes-like object is required, not 'str'``：
     "所有集合都打不开"这条**本该只记日志并退避重试**的路径，实际结果是
     读取线程直接崩掉，那台手柄从此不再被读取。
+
+    key 现在有两种形态：
+    ``054C:09CC#8&2657b139&0&0000``（HID 实例段）
+    ``054C:0CE6#USB\\VID_054C&PID_0CE6\\1C784B8B409B0000``（物理设备 ID）
+    两者都取**最后一段**最有信息量的部分。
     """
     if isinstance(key, (bytes, bytearray)):
         key = key.decode("utf-8", "replace")
     else:
         key = str(key)
-    return key.split("#")[-1][:8] if "#" in key else key[:8]
+    tail = key.split("#")[-1]
+    if "\\" in tail:
+        tail = tail.split("\\")[-1]
+    return tail[:8]
 
 
 def lowest_battery_view(views: List[ControllerView]) -> Optional[ControllerView]:

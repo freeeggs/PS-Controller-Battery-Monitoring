@@ -753,6 +753,159 @@ class StaleBatteryTests(unittest.TestCase):
         self.assertEqual(record.view.percent, 75)
 
 
+class CompositeDeviceTests(unittest.TestCase):
+    """复合设备（USB 无线适配器）不得把一个手柄显示成好几台。
+
+    真机数据（DualSense 走 USB 适配器）：一个手柄暴露 4 个 HID 集合::
+
+        up=1  u=5   Game Pad          ← 真正的主集合（能读到电量）
+        up=1  u=6   Keyboard          ┐ 触控板附带的
+        up=12 u=1   Consumer Control  ├ 三个集合，
+        up=1  u=2   Mouse             ┘ 永远不会带电量
+
+    它们分属 ``MI_03`` / ``MI_04`` 两个接口，HID 实例段也各不相同
+    （``&0000`` / ``&0001`` / ``&0002``），所以按 HID 路径分组会得到 4 台设备 ——
+    界面上就是"一台 75% + 三台电量未知"。
+    """
+
+    #: 真机抓到的 4 条路径（原样保留，回归测试直接用它们）
+    REAL_PATHS = [
+        (r"\\?\HID#VID_054C&PID_0CE6&MI_03#9&22b58c18&0&0000"
+         r"#{4d1e55b2-f16f-11cf-88cb-001111000030}", 0x01, 0x05, 3),
+        (r"\\?\HID#VID_054C&PID_0CE6&MI_04&Col01#9&6a2d811&0&0000"
+         r"#{4d1e55b2-f16f-11cf-88cb-001111000030}\KBD", 0x01, 0x06, 4),
+        (r"\\?\HID#VID_054C&PID_0CE6&MI_04&Col02#9&6a2d811&0&0001"
+         r"#{4d1e55b2-f16f-11cf-88cb-001111000030}", 0x0C, 0x01, 4),
+        (r"\\?\HID#VID_054C&PID_0CE6&MI_04&Col03#9&6a2d811&0&0002"
+         r"#{4d1e55b2-f16f-11cf-88cb-001111000030}", 0x01, 0x02, 4),
+    ]
+
+    def _infos(self):
+        from psbt.controllers.backend import HidDeviceInfo
+
+        return [
+            HidDeviceInfo(
+                path=p.encode(), vendor_id=0x054C, product_id=0x0CE6,
+                product_string="DualSense Wireless Controller",
+                usage_page=up, usage=u, interface_number=iface, bus_type=1,
+            )
+            for (p, up, u, iface) in self.REAL_PATHS
+        ]
+
+    def test_touchpad_collections_are_not_controllers(self):
+        from psbt.controllers import backend
+
+        verdicts = [(i.usage_page, i.usage, backend.is_controller_collection(i))
+                    for i in self._infos()]
+        self.assertTrue(verdicts[0][2], "Game Pad 集合必须被认作手柄")
+        self.assertFalse(verdicts[1][2], "键盘集合不是手柄")
+        self.assertFalse(verdicts[2][2], "消费类集合不是手柄")
+        self.assertFalse(verdicts[3][2], "鼠标集合不是手柄")
+
+    def test_bluetooth_ds4_undefined_collection_is_kept(self):
+        """蓝牙 DS4 报的是 up=0 u=0（未定义），不能被筛掉。"""
+        from psbt.controllers.backend import HidDeviceInfo, is_controller_collection
+
+        info = HidDeviceInfo(path=b"x", vendor_id=0x054C, product_id=0x09CC,
+                             usage_page=0, usage=0, bus_type=2)
+        self.assertTrue(is_controller_collection(info))
+
+    def test_controller_candidates_drops_phantoms(self):
+        from psbt.controllers import backend
+
+        cands = backend.controller_candidates(self._infos())
+        self.assertEqual(len(cands), 1, "只剩主集合")
+        self.assertEqual((cands[0].usage_page, cands[0].usage), (0x01, 0x05))
+
+    def test_controller_candidates_never_empties_a_device(self):
+        """一个集合都不像手柄时不许把设备筛没（宁可保留原样）。"""
+        from psbt.controllers import backend
+
+        infos = [i for i in self._infos() if i.usage_page == 0x0C]
+        cands = backend.controller_candidates(infos)
+        self.assertEqual(len(cands), 1)
+
+    def test_physical_device_id_merges_interfaces(self):
+        """4 个集合必须归到同一个物理设备。"""
+        from psbt.controllers import physid
+
+        ids = {physid.physical_device_id(i.path) for i in self._infos()}
+        if ids == {None}:
+            self.skipTest("本机取不到物理设备 ID（cfgmgr32 不可用或非 Windows）")
+        self.assertEqual(len(ids), 1, "同一手柄的多个接口应归为一台：%s" % ids)
+        self.assertTrue(list(ids)[0].upper().startswith("USB\\"))
+
+    def test_device_key_groups_by_physical_device(self):
+        """device_key 必须一致 —— 这是界面只显示一台的关键。"""
+        from psbt.controllers import backend, physid
+        from psbt.controllers.models import Transport
+
+        infos = self._infos()
+        if physid.physical_device_id(infos[0].path) is None:
+            self.skipTest("本机取不到物理设备 ID")
+        keys = {i.device_key for i in infos}
+        self.assertEqual(len(keys), 1, "4 个集合应共用一个 device_key：%s" % keys)
+
+    def test_device_key_falls_back_to_instance_segment(self):
+        """拿不到物理设备时回退到 HID 实例段（蓝牙走这条），行为与旧版一致。"""
+        from psbt.controllers import backend, physid
+
+        infos = self._infos()
+        original = physid.physical_device_id
+        try:
+            physid.physical_device_id = lambda path: None
+            keys = [i.device_key for i in infos]
+        finally:
+            physid.physical_device_id = original
+        self.assertEqual(len(set(keys)), 4, "回退后每集合各成一组（旧行为）")
+        for k in keys:
+            self.assertIn("&", k.split("#")[-1])
+
+    def test_hid_instance_id_parsing(self):
+        from psbt.controllers import physid
+
+        self.assertEqual(
+            physid.hid_instance_id(self.REAL_PATHS[1][0]),
+            r"HID\VID_054C&PID_0CE6&MI_04&Col01\9&6a2d811&0&0000")
+        self.assertEqual(
+            physid.hid_instance_id(b"\\?\HID#VID_054C&PID_09CC#7&abc&0&0000#{g}"),
+            r"HID\VID_054C&PID_09CC\7&abc&0&0000")
+        self.assertIsNone(physid.hid_instance_id("not-a-hid-path"))
+        self.assertIsNone(physid.hid_instance_id(b""))
+
+    def test_hub_and_interface_nodes_are_not_devices(self):
+        from psbt.controllers import physid
+
+        # 接口节点
+        self.assertFalse(physid._is_physical_usb_device(          # noqa: SLF001
+            r"USB\VID_054C&PID_0CE6&MI_04\8&1DF12F96&1&0004"))
+        # HUB 节点
+        self.assertFalse(physid._is_physical_usb_device(          # noqa: SLF001
+            r"USB\ROOT_HUB30\5&201A262C&0&0"))
+        self.assertFalse(physid._is_physical_usb_device(          # noqa: SLF001
+            r"USB\VID_1A40&PID_0101\6&28CF390B&0&12"))
+        # 蓝牙节点
+        self.assertFalse(physid._is_physical_usb_device(          # noqa: SLF001
+            r"BTHENUM\{00001124-0000-1000-8000-00805f9b34fb}_VID&0002054c_PID&09cc\7&a&0&0000"))
+        # 真设备
+        self.assertTrue(physid._is_physical_usb_device(           # noqa: SLF001
+            r"USB\VID_054C&PID_0CE6\1C784B8B409B0000"))
+
+    def test_bluetooth_parent_chain_never_reaches_the_radio(self):
+        """★ 关键防线：蓝牙设备的父链上出现非 USB 节点时必须立刻停手。
+
+        否则会一路爬到**蓝牙适配器**（它本身挂在 USB 总线上），
+        把同一台机器的所有蓝牙手柄并成一台 —— 比多几个幽灵条目严重得多。
+        """
+        from psbt.controllers import physid
+
+        self.assertFalse(physid._is_usb_node(                     # noqa: SLF001
+            r"BTHENUM\{00001124-0000-1000-8000-00805f9b34fb}_VID&0002054c_PID&09cc\7&a&0&0000"))
+        self.assertFalse(physid._is_usb_node(r"BTHLE\DEV_1234\7&a&0&0000"))   # noqa: SLF001
+        self.assertTrue(physid._is_usb_node(                      # noqa: SLF001
+            r"USB\VID_8087&PID_0026\5&1&0&1"))
+
+
 class ReaderRobustnessTests(unittest.TestCase):
     """读取线程的日志辅助函数必须吃得下 hidapi 的 bytes 路径。"""
 
