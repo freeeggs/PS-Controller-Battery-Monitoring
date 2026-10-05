@@ -847,19 +847,72 @@ class CompositeDeviceTests(unittest.TestCase):
         self.assertEqual(len(keys), 1, "4 个集合应共用一个 device_key：%s" % keys)
 
     def test_device_key_falls_back_to_instance_segment(self):
-        """拿不到物理设备时回退到 HID 实例段（蓝牙走这条），行为与旧版一致。"""
+        """MAC 与物理设备都拿不到时，回退到 HID 实例段（行为与旧版一致）。"""
         from psbt.controllers import backend, physid
 
         infos = self._infos()
-        original = physid.physical_device_id
+        orig_phys = physid.physical_device_id
+        orig_mac = backend.controller_mac
         try:
             physid.physical_device_id = lambda path: None
+            backend.controller_mac = lambda info: None
+            backend.clear_mac_cache()
             keys = [i.device_key for i in infos]
         finally:
-            physid.physical_device_id = original
+            physid.physical_device_id = orig_phys
+            backend.controller_mac = orig_mac
+            backend.clear_mac_cache()
         self.assertEqual(len(set(keys)), 4, "回退后每集合各成一组（旧行为）")
         for k in keys:
             self.assertIn("&", k.split("#")[-1])
+
+    def test_mac_is_resolved_once_per_physical_device(self):
+        """★ MAC 必须**按物理设备**解析，不是按集合。
+
+        曾经的实现按设备路径缓存，于是可能出现"主集合读到了 MAC、触控板集合
+        没读到" —— 同一个手柄算出两个分组键，1.5 修掉的"一个手柄显示成好几台"
+        就会回来。这里让除主集合外的路径都打不开，四个集合仍必须共用同一个 key。
+
+        .. note::
+           物理设备 ID 显式打桩：真实路径对应的是**上一次**插拔的 devnode，
+           机器状态一变结果就不同，测试不能依赖它。
+        """
+        from psbt.controllers import backend, physid
+
+        infos = self._infos()
+        payload = bytes.fromhex("09 4E B3 82 56 27 0C 08 25 00 DA 47 64 28 AF 44 00 00 00 00")
+        opened = []
+
+        class _FakeHandle:
+            def __init__(self, info):
+                self.info = info
+
+            def open(self):
+                # 只有主游戏控制器集合（MI_03）能打开
+                ok = b"MI_03" in self.info.path
+                opened.append(ok)
+                return ok
+
+            def get_feature_report(self, report_id, length=64):
+                return payload if report_id == 0x09 else None
+
+            def close(self):
+                pass
+
+        orig_handle = backend.HidHandle
+        orig_phys = physid.physical_device_id
+        try:
+            backend.HidHandle = _FakeHandle
+            physid.physical_device_id = lambda path: r"USB\VID_054C&PID_0CE6\STUB"
+            backend.clear_mac_cache()
+            keys = {i.device_key for i in infos}
+        finally:
+            backend.HidHandle = orig_handle
+            physid.physical_device_id = orig_phys
+            backend.clear_mac_cache()
+        self.assertEqual(len(keys), 1,
+                         "四个集合必须共用一个 key：%s" % keys)
+        self.assertIn("MAC:0c275682b34e", keys.pop())
 
     def test_hid_instance_id_parsing(self):
         from psbt.controllers import physid
@@ -1066,10 +1119,11 @@ class SameControllerTwoTransportsTests(unittest.TestCase):
         self.assertNotEqual(usb.device_key, bt.device_key)
         self.assertNotIn("MAC:", usb.device_key)
 
-    def test_usb_is_preferred_over_bluetooth(self):
-        """同一台手柄两条总线都在时，候选必须**确定性地** USB 优先。
+    def test_usb_is_preferred_for_dualsense(self):
+        """DualSense 两条总线都在时**确定性地 USB 优先**。
 
         否则每轮扫描都可能认为"HID 路径变了"并重启读取线程，界面会抖。
+        真机实测 DualSense 走 USB 充电时能给出正确等级（如"65% 充电中"）。
         """
         self._stub_feature_reads()
         usb = self._info(self.USB_PATH, bus_type=1, serial="")
@@ -1078,6 +1132,199 @@ class SameControllerTwoTransportsTests(unittest.TestCase):
             picked = self.backend.controller_candidates(order)
             self.assertEqual(picked[0].transport.label, "USB")
             self.assertEqual(len(picked), 2, "蓝牙那条要留作兜底")
+
+    def test_bluetooth_is_preferred_for_ds4(self):
+        """DS4 反过来：**蓝牙优先**。
+
+        真机实测（CUH-ZCT2）：它一插上 USB，USB 报告的 status[0] 就恒定报
+        0x1B（"充电中"标记，不含等级）；真实等级只在**蓝牙**链路那些"未插线"
+        的帧里出现。走 USB 的话充电期间就永远看不到电量。
+        """
+        from psbt.controllers.backend import HidDeviceInfo
+
+        def ds4(path, bus_type, serial=""):
+            return HidDeviceInfo(
+                path=path, vendor_id=0x054C, product_id=0x09CC,
+                product_string="DualShock 4 (CUH-ZCT2)", serial=serial,
+                usage_page=1, usage=5, interface_number=-1, bus_type=bus_type)
+
+        usb = ds4(self.USB_PATH, 1)
+        bt = ds4(self.BT_PATH, 2, serial="28c13c8852c4")
+        for order in ([usb, bt], [bt, usb]):
+            picked = self.backend.controller_candidates(order)
+            self.assertEqual(picked[0].transport.label, "蓝牙")
+            self.assertEqual(len(picked), 2, "USB 那条要留作兜底")
+
+
+class DS4ChargingCarryForwardTests(unittest.TestCase):
+    """插线后读到"不带电量的充电帧"：沿用上一次真实等级。
+
+    用户症状：DS4 插上 USB 后电量从 **85% 变成 100%**。
+    真机序列（13:29:07 → 13:29:14）：
+
+    =========================  ==================  ==============
+    时间                        报告 status[0]      旧行为
+    =========================  ==================  ==============
+    13:29:07 蓝牙               0x08                85%（真实）
+    13:29:13 蓝牙               0x1B                100% ✗
+    13:29:14 USB                0x1B                100% ✗
+    =========================  ==================  ==============
+
+    0x1B（低 4 位 = 11）只是"插着线在充电"的标记，不含等级。修好之后：
+    等级沿用上一次真实读数（85%），状态改为充电中 —— 既不假报 100%，
+    也不会在"未知"与真实等级之间跳（这种帧每秒几百条）。
+    """
+
+    def _manager_with_ds4(self):
+        from psbt.controllers import backend, registry
+        from psbt.controllers.manager import ControllerManager
+        from psbt.controllers.models import FAMILY_DS4, MutableController, ControllerView
+
+        info = backend.HidDeviceInfo(
+            path=b"\\\\?\\HID#VID_054C&PID_09CC&MI_03#8&4662d51&0&0000#{g}",
+            vendor_id=0x054C, product_id=0x09CC, product_string="DualShock 4",
+            usage_page=1, usage=5, interface_number=-1, bus_type=1)
+        manager = ControllerManager(Config())
+        view = ControllerView(
+            key=info.device_key, family=FAMILY_DS4,
+            display_name=registry.lookup(0x054C, 0x09CC).name,
+            transport=info.transport, vendor_id=0x054C, product_id=0x09CC)
+        manager._records[view.key] = MutableController(view=view)   # noqa: SLF001
+        return manager, view.key
+
+    def _feed(self, manager, key, raw):
+        from psbt.controllers import parsers
+
+        manager._update_battery(                                    # noqa: SLF001
+            key, parsers.interpret_ds4(raw), bytes([raw]))
+
+    def test_85_percent_survives_plugging_in_the_cable(self):
+        manager, key = self._manager_with_ds4()
+        self._feed(manager, key, 0x08)                  # 未插线：真实 85%
+        view = manager._records[key].view               # noqa: SLF001
+        self.assertEqual(view.percent, 85)
+
+        self._feed(manager, key, 0x1B)                  # 插线：无等级的充电帧
+        view = manager._records[key].view               # noqa: SLF001
+        self.assertEqual(view.percent, 85, "不得被改写成 100%")
+        self.assertEqual(view.battery.state.value, "charging")
+
+    def test_unknown_stays_unknown_without_history(self):
+        """从没读到过真实等级时，充电帧就显示未知（不编一个 100%）。"""
+        manager, key = self._manager_with_ds4()
+        self._feed(manager, key, 0x1B)
+        view = manager._records[key].view               # noqa: SLF001
+        self.assertIsNone(view.percent)
+        self.assertEqual(view.battery.state.value, "charging")
+
+    def test_real_charging_level_overrides_carried_value(self):
+        """带等级的充电帧要照常更新（如 0x18 = 充电中 85%）。"""
+        manager, key = self._manager_with_ds4()
+        self._feed(manager, key, 0x1B)
+        self._feed(manager, key, 0x09)                  # 未插线 95%
+        self._feed(manager, key, 0x18)                  # 插线 + 等级 8
+        view = manager._records[key].view               # noqa: SLF001
+        self.assertEqual(view.percent, 85)
+        self.assertEqual(view.battery.state.value, "charging")
+
+    def test_no_alert_from_the_charging_code(self):
+        """护栏：0x1B 不得让策略认为"电量耗尽"。"""
+        from psbt.controllers.models import ControllerView
+        from psbt.notify.policy import LowBatteryPolicy
+
+        manager, key = self._manager_with_ds4()
+        self._feed(manager, key, 0x1B)
+        view = manager._records[key].view               # noqa: SLF001
+        policy = LowBatteryPolicy([30, 20, 10])
+        self.assertIsNone(policy.evaluate(view))
+
+
+class ParseThrottleTests(unittest.TestCase):
+    """节流不能让"稍纵即逝的电量帧"被漏掉。
+
+    DS4 插线后每秒几百帧都报"充电中"标记（不带等级），**真正的等级只在充电器
+    脉冲间隙那几帧里出现**（间隔几十秒、只持续几毫秒）。读取循环按 4Hz 节流
+    （`report_min_gap`），整段错过就会导致充电期间一直显示"电量未知"。
+    所以电量字节一变就必须立刻解析。
+    """
+
+    def test_peek_battery_byte_per_family_and_transport(self):
+        from psbt.controllers import parsers
+        from psbt.controllers.models import FAMILY_DS4, FAMILY_DUALSENSE, Transport
+
+        ds4_usb = bytes([0x01] + [0] * 29 + [0x1B] + [0] * 34)
+        ds4_bt = bytes([0x11, 0xC0, 0x00] + [0] * 29 + [0x08, 0]) + bytes(46)
+        ds_minimal = bytes([0x01] + [0] * 9)                  # 蓝牙精简报告
+        self.assertEqual(parsers.peek_battery_byte(FAMILY_DS4, Transport.USB, ds4_usb), 0x1B)
+        self.assertEqual(parsers.peek_battery_byte(FAMILY_DS4, Transport.BLUETOOTH, ds4_bt), 0x08)
+        self.assertIsNone(parsers.peek_battery_byte(FAMILY_DS4, Transport.BLUETOOTH, ds_minimal))
+
+        ds5 = bytearray(78)
+        ds5[0] = 0x31
+        ds5[54] = 0x16
+        self.assertEqual(parsers.peek_battery_byte(FAMILY_DUALSENSE, Transport.BLUETOOTH,
+                                                   bytes(ds5)), 0x16)
+
+    def test_level_frame_is_parsed_without_waiting_for_throttle(self):
+        """★ 真等级帧必须马上被解析，哪怕还在节流窗口内。
+
+        构造的数据流：3 帧"充电中标记" → **1 帧真等级** → 大量标记帧。
+        若没有"字节一变就解析"这条，那唯一一帧真等级会落在 0.25s 节流窗口里
+        被丢掉，之后全是标记帧（不带等级）→ 永远读不到 85%。
+        """
+        import time
+
+        from psbt.controllers import backend
+        from psbt.controllers.manager import ControllerManager, _Reader
+        from psbt.controllers.models import (FAMILY_DS4, ControllerView,
+                                            MutableController, Transport)
+
+        def frame(status):
+            return bytes([0x11, 0xC0, 0x00] + [0] * 29 + [status, 0x00]) + bytes(46)
+
+        stream = [frame(0x1B)] * 3 + [frame(0x08)] + [frame(0x1B)] * 100000
+
+        class _FakeHandle:
+            def __init__(self, info):
+                self.info = info
+                self.is_open = True
+                self._it = iter(stream)
+
+            def open(self):
+                return True
+
+            def read(self, size, timeout):
+                try:
+                    return next(self._it)
+                except StopIteration:
+                    time.sleep(0.05)
+                    return b""
+
+            def close(self):
+                self.is_open = False
+
+        manager = ControllerManager(Config())
+        view = ControllerView(
+            key="ds4", family=FAMILY_DS4, display_name="DualShock 4 (CUH-ZCT2)",
+            transport=Transport.BLUETOOTH, vendor_id=0x054C, product_id=0x09CC)
+        record = MutableController(view=view, candidate_paths=[b"fake"])
+        manager._records[view.key] = record               # noqa: SLF001
+
+        orig = backend.HidHandle
+        reader = None
+        try:
+            backend.HidHandle = _FakeHandle
+            reader = _Reader(manager, record)
+            reader.start()
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and record.view.battery.percent is None:
+                time.sleep(0.02)
+        finally:
+            if reader is not None:
+                reader.shutdown()
+            backend.HidHandle = orig
+        self.assertEqual(record.view.battery.percent, 85,
+                         "夹在节流窗口内的真等级帧不得被漏掉")
 
 
 class ReaderRobustnessTests(unittest.TestCase):

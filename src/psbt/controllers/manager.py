@@ -299,6 +299,19 @@ class ControllerManager:
             old = record.view.battery
             old_note = record.view.note
             new_note = old_note if note is None else note
+
+            # 「正在充电，但这一帧没带电量」不覆盖已有读数。
+            #
+            # 真机场景（DS4 插上 USB）：手柄每秒几百帧地把 status[0] 报成
+            # 0x1B（插线 + 低 4 位 11），**这帧里没有真实等级**；真实的等级
+            # 只在充电器脉冲间隙那几帧（未插线、0x08）里出现。若照单全收，
+            # 界面就会在"未知"和真实等级之间疯狂跳动。
+            # 所以：保留上一次真实读到的等级，只更新充电状态。
+            if (battery.level is None and battery.percent is None
+                    and battery.state == ChargeState.CHARGING
+                    and old.level is not None):
+                battery = replace(battery, level=old.level, percent=old.percent)
+
             record.last_raw = raw
             record.view = replace(record.view, battery=battery, note=new_note)
             changed = (
@@ -354,6 +367,7 @@ class _Reader(threading.Thread):
         self._timeout = manager.config.read_timeout_ms
         self._error_limit = manager.config.read_error_limit
         self._minimal_reports = 0
+        self._last_status_byte: Optional[int] = None
 
     # -- 生命周期 --
     def shutdown(self) -> None:
@@ -407,12 +421,19 @@ class _Reader(threading.Thread):
             self.record.last_report_ts = time.monotonic()
 
             now = time.monotonic()
-            if (now - self.record.last_parse_ts) >= self._min_gap:
+            # 节流是为了省 CPU（蓝牙可达 250Hz），但**电量字段一变就必须立刻解析**，
+            # 否则会漏掉稍纵即逝的状态：实测 DS4 插线后每秒几百帧都报"充电中"标记，
+            # 真正的等级只在充电器脉冲间隙那几帧里出现（间隔几十秒、只持续几毫秒），
+            # 按 4Hz 节流很容易整段错过 → 充电期间一直显示"电量未知"。
+            # 探测只需读一个字节，开销可忽略。
+            status = parsers.peek_battery_byte(
+                self.record.view.family, self.record.view.transport, data)
+            due = (now - self.record.last_parse_ts) >= self._min_gap
+            if due or (status is not None and status != self._last_status_byte):
+                self._last_status_byte = status
                 self.record.last_parse_ts = now
                 self._parse(data)
             else:
-                # 手柄（尤其蓝牙）报告速率可达 250Hz，节流到 ~4Hz 足够，
-                # 又不至于让 Python 层空转。
                 self._stop.wait(self._min_gap)
 
     # -- HID 打开 / 轮换集合 --

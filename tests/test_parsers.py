@@ -76,9 +76,18 @@ class DS4ParseTests(unittest.TestCase):
         report = self._parse(0x10 | 0x0A, Transport.USB, 64)
         self.assertEqual((report.state, report.percent), (ChargeState.CHARGING, 100))
 
-    def test_status_11_means_full(self):
+    def test_status_11_means_charging_not_full(self):
+        """插线时低 4 位 11 —— 内核叫它"已充满"，**但真机证明它只是"充电中"**。
+
+        2026-10-05 实测（用户反馈"接 USB 误报 100"）：DS4 一插上线就固定报
+        0x1B（低 4 位 = 11），而当时真实电量只有 85%（充电器脉冲间隙那几帧报
+        0x08，那才是真实等级）。照内核映射成 100% 会给出假读数，所以这里只
+        声明"充电中"、不给等级；等级由管理器沿用上一次真实读数，
+        详见 DS4ChargingCarryForwardTests。
+        """
         report = self._parse(0x10 | 0x0B, Transport.USB, 64)
-        self.assertEqual((report.state, report.percent), (ChargeState.FULL, 100))
+        self.assertEqual(report.state, ChargeState.CHARGING)
+        self.assertIsNone(report.percent, "不能报成 100%")
 
     def test_status_14_15_are_error_not_zero(self):
         for raw in (0x10 | 0x0E, 0x10 | 0x0F):
@@ -394,6 +403,55 @@ class StubReportTests(unittest.TestCase):
                 "空壳报告不得触发提醒：%s/%s" % (family, transport.label))
             self.assertIsNone(view.percent,
                               "图标也不应显示百分比：%s/%s" % (family, transport.label))
+
+
+class DS4ChargingCodeTests(unittest.TestCase):
+    """DS4 插上 USB 后固定报"低 4 位 = 11" —— 那不是电量，不能当成 100%。
+
+    真机实测（CUH-ZCT2，2026-10-05；用户反馈"接入 usb 会误报 100"）：
+
+    * 未插线：``0x08`` → 低 4 位 8 → 约 85%（真实电量）
+    * 一插上 USB：**立刻**变成 ``0x1B`` 并**一直保持**（实测 8 秒 4003 帧 USB +
+      1876 帧蓝牙，无一例外），与真实电量无关
+    * 充电期间偶尔插进来一帧"未插线"的 ``0x08``（充电器脉冲间隙），
+      那才是真实等级
+
+    内核 ``hid-playstation.c`` 把"插线时 11"注释成 "battery is full"，照抄就会
+    在 85% 时显示 100%。
+    """
+
+    def test_cable_plugged_eleven_is_not_a_level(self):
+        r = parsers.interpret_ds4(0x1B)
+        self.assertIsNone(r.level, "11 不是电量")
+        self.assertIsNone(r.percent, "不能报成 100%")
+        self.assertEqual(r.state, ChargeState.CHARGING, "但确实是充电中")
+
+    def test_cable_clear_real_level(self):
+        r = parsers.interpret_ds4(0x08)
+        self.assertEqual((r.level, r.percent), (8, 85))
+        self.assertEqual(r.state, ChargeState.DISCHARGING)
+
+    def test_cable_plugged_with_real_level_still_works(self):
+        """插线 + 0~10 是真等级（内核规则），照常解析。"""
+        r = parsers.interpret_ds4(0x18)
+        self.assertEqual((r.level, r.percent), (8, 85))
+        self.assertEqual(r.state, ChargeState.CHARGING)
+
+    def test_cable_plugged_ten_is_100(self):
+        r = parsers.interpret_ds4(0x1A)
+        self.assertEqual((r.percent, r.state), (100, ChargeState.CHARGING))
+
+    def test_cable_clear_undefined_is_not_100(self):
+        """未插线时的 11 及以上是未定义值，也不能当成 100%。"""
+        for raw in (0x0B, 0x0C, 0x0D, 0x0E, 0x0F):
+            self.assertIsNone(parsers.interpret_ds4(raw).percent, hex(raw))
+
+    def test_errors_stay_errors(self):
+        """14 电压/温度异常、15 充电错误 → 异常，不是 100%。"""
+        for raw in (0x1E, 0x1F):
+            r = parsers.interpret_ds4(raw)
+            self.assertEqual(r.state, ChargeState.ERROR, hex(raw))
+            self.assertIsNone(r.percent)
 
 
 class ProtocolDocTests(unittest.TestCase):

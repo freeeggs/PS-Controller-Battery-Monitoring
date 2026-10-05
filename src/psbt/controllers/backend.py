@@ -23,7 +23,7 @@ from typing import Dict, List, Optional
 
 from ..logs import get_logger
 from . import physid, registry
-from .models import Transport
+from .models import FAMILY_DUALSENSE, Transport
 
 log = get_logger("hid")
 
@@ -219,15 +219,30 @@ def find_playstation_devices() -> Optional[List[HidDeviceInfo]]:
 
 
 def _transport_rank(info: HidDeviceInfo) -> int:
-    """同一条手柄同时出现在多个总线上时，**优先用 USB**。
+    """同一只手柄同时出现在多个总线上时，该优先用哪条链路。
 
-    手柄蓝牙连着时插上 USB 线，Windows 会同时暴露 USB 与蓝牙两条设备、
-    两条都能开。如果排序不确定，每轮扫描都可能认为"HID 路径变了"并重启
-    读取线程 —— 界面会跟着抖。所以这里给一个确定性的偏好：USB 优先
-    （有线链路更稳、无需请求完整报告模式）。蓝牙那条仍会留在候选列表里，
-    USB 打不开时会自动回落（见 :func:`all_candidates_for`）。
+    目的首先是**确定性**：两条链路都在线时若排序不稳，每轮扫描都会认为
+    "HID 路径变了"并重启读取线程，界面会跟着抖。
+
+    优先级按**实测证据**定，不是一刀切：
+
+    * **DualSense**：USB 优先。真机实测插着 USB 充电时 USB 报告能给出正确
+      等级（如"65% 充电中"），有线链路也更稳。
+    * **DualShock 4**：**蓝牙优先**。真机实测（CUH-ZCT2）它一插上 USB，
+      USB 报告的低 4 位就**恒定**报 11（"充电中"标记，不含等级，见
+      :func:`parsers.interpret_ds4`）；真实等级只在**蓝牙**链路那些
+      "未插线"的帧里出现（充电器脉冲间隙）。走蓝牙才能显示真实电量。
+
+    另一条链路仍留在候选列表里，当前链路打不开时会自动回落
+    （见 :func:`all_candidates_for`）。
     """
-    return 0 if info.transport == Transport.USB else 1
+    spec = registry.lookup(info.vendor_id, info.product_id)
+    family = spec.family if spec else ""
+    if family == FAMILY_DUALSENSE:
+        order = (Transport.USB, Transport.BLUETOOTH)
+    else:
+        order = (Transport.BLUETOOTH, Transport.USB)
+    return order.index(info.transport) if info.transport in order else len(order)
 
 
 def candidates_for(infos: List[HidDeviceInfo]) -> List[HidDeviceInfo]:
@@ -433,44 +448,86 @@ def dualsense_firmware_info(handle: HidHandle) -> Optional[bytes]:
 #   特性报告 0x09 = 09 4E B3 82 56 27 0C ...  → 反转 → 0c275682b34e
 #   蓝牙侧 serial_number = '0c275682b34e'              一致 ✓
 
-_mac_cache: Dict[bytes, Optional[str]] = {}
+_mac_cache: Dict[object, Optional[str]] = {}
 _MAC_MISS = object()
+
+
+def _collections_of(info: HidDeviceInfo) -> List[HidDeviceInfo]:
+    """同一个**物理设备**下的所有集合，按"最像手柄"的顺序排。
+
+    为什么要一起看：一个手柄会暴露多个 HID 集合（主游戏控制器 + 触控板的
+    键鼠集合）。配对信息特性报告只有主集合（或其中一部分）能读，
+    只拿手上这一个集合去读，可能"恰好读不到"。
+    """
+    try:
+        all_dev = enumerate_all() or []
+    except Exception:
+        return [info]
+    anchor = physid.physical_device_id(info.path)
+    group = [d for d in all_dev
+             if d.vendor_id == info.vendor_id and d.product_id == info.product_id
+             and (physid.physical_device_id(d.path) or d.path) == (anchor or info.path)]
+    return candidates_for(group) or [info]
+
+
+def _read_pairing_mac(info: HidDeviceInfo) -> Optional[str]:
+    entry = physid.PAIRING_REPORT.get(info.product_id)
+    if entry is None:
+        return None
+    report_id, length = entry
+    handle = HidHandle(info)
+    try:
+        if not handle.open():
+            return None
+        payload = handle.get_feature_report(report_id, length)
+    except Exception as exc:                       # 读不到不算错误，只是没标识
+        log.debug("读取配对信息特性报告失败（%s）：%s", info, exc)
+        return None
+    finally:
+        try:
+            handle.close()
+        except Exception:
+            pass
+    mac = physid.mac_from_feature_report(payload)
+    if mac:
+        log.debug("从特性报告 0x%02X 取到手柄 MAC：%s", report_id, mac)
+    return mac
 
 
 def controller_mac(info: HidDeviceInfo) -> Optional[str]:
     """返回手柄自己的 MAC（12 位小写十六进制），拿不到返回 ``None``。
 
-    优先用 ``serial_number``（蓝牙连接时就是 MAC）；拿不到就打开设备读一次
-    配对信息特性报告。**结果按设备路径缓存** —— 一条路径只读一次，
-    重插会换路径、缓存自然失效。
+    .. important::
+       **缓存单位是"物理设备"，不是单个集合。** 一个手柄的多个集合必须共用
+       同一个结果 —— 否则会出现"主集合拿到了 MAC、触控板集合没拿到"，
+       同一个手柄算出两个分组键，1.5 修掉的"一个手柄显示成好几台"就会回来。
+
+    取法（内核 hid-playstation.c 的两条来源）：
+    1. 设备唯一串 —— 蓝牙连接时 ``serial_number`` 本身就是 MAC；
+    2. 配对信息特性报告 —— USB 连接时 ``serial_number`` 是空的，
+       DualSense 用 ``0x09`` / DualShock 4 用 ``0x12``，MAC 在小端序的 ``[1..6]``。
+
+    第 2 步会按"最像手柄"的顺序**逐个集合尝试**，避免恰好拿到一个读不了的集合。
     """
-    key = info.path
-    cached = _mac_cache.get(key, _MAC_MISS)
+    anchor = physid.physical_device_id(info.path) or info.path
+    cached = _mac_cache.get(anchor, _MAC_MISS)
     if cached is not _MAC_MISS:
         return cached                                  # type: ignore[return-value]
 
-    mac = physid.normalize_mac(info.serial)
-    if mac is None and info.product_id in physid.PAIRING_REPORT:
-        report_id, length = physid.PAIRING_REPORT[info.product_id]
-        payload = None
-        handle = HidHandle(info)
-        try:
-            if handle.open():
-                payload = handle.get_feature_report(report_id, length)
-        except Exception as exc:                       # 读不到不算错误，只是没标识
-            log.debug("读取配对信息特性报告失败（%s）：%s", info, exc)
-        finally:
-            try:
-                handle.close()
-            except Exception:
-                pass
-        mac = physid.mac_from_feature_report(payload)
+    mac = None
+    for cand in _collections_of(info):
+        mac = physid.normalize_mac(cand.serial)
         if mac:
-            log.debug("从特性报告 0x%02X 取到手柄 MAC：%s", report_id, mac)
+            break
+    if mac is None:
+        for cand in _collections_of(info):
+            mac = _read_pairing_mac(cand)
+            if mac:
+                break
 
     if len(_mac_cache) > 64:                           # 防止无界增长
         _mac_cache.clear()
-    _mac_cache[key] = mac
+    _mac_cache[anchor] = mac
     return mac
 
 
