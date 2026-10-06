@@ -66,6 +66,7 @@ build\build.ps1
 
 | 文档 | 内容 |
 |---|---|
+| [CHANGELOG.md](CHANGELOG.md) | **1.4 → 1.8 更新记录（中英对照）** |
 | [docs/USAGE.md](docs/USAGE.md) | 详细用法、配置项全表、图标规则、已知问题、版本历史 |
 | [docs/TECHNICAL_FEASIBILITY.md](docs/TECHNICAL_FEASIBILITY.md) | 协议依据、字节偏移推导、可行性论证 |
 
