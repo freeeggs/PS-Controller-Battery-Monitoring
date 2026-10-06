@@ -22,8 +22,8 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from ..logs import get_logger
-from . import registry
-from .models import Transport
+from . import physid, registry
+from .models import FAMILY_DUALSENSE, Transport
 
 log = get_logger("hid")
 
@@ -74,8 +74,23 @@ class HidDeviceInfo:
 
     @property
     def device_key(self) -> str:
-        """同一物理设备的所有集合共用一个 key。"""
-        return "%04X:%04X#%s" % (self.vendor_id, self.product_id, _device_instance(self.path))
+        """同一物理设备的所有集合共用一个 key；**同一手柄跨总线也用同一个 key**。
+
+        优先级：
+
+        1. **手柄自己的 MAC**（见 :func:`controller_mac`）—— 唯一能跨总线对齐的
+           标识。手柄蓝牙连着时插上 USB 线，Windows 会同时暴露两条设备，
+           只有 MAC 相同才能认出"这是同一只手柄"，从而不显示成两条。
+        2. 父 USB 设备的实例 ID（见 :mod:`physid`）—— 复合设备会把一个手柄
+           暴露成多个接口，各接口的 HID 实例段互不相同，只按 HID 路径分组
+           会把**一个手柄显示成好几台**。
+        3. HID 实例段 —— 都拿不到时的兜底，与旧行为一致。
+        """
+        mac = controller_mac(self)
+        if mac:
+            return "%04X:%04X#MAC:%s" % (self.vendor_id, self.product_id, mac)
+        anchor = physid.physical_device_id(self.path) or _device_instance(self.path)
+        return "%04X:%04X#%s" % (self.vendor_id, self.product_id, anchor)
 
     def __str__(self) -> str:
         return "%s (%04X:%04X %s up=%s u=%s bus=%s)" % (
@@ -198,14 +213,73 @@ def find_playstation_devices() -> Optional[List[HidDeviceInfo]]:
 
     result: List[HidDeviceInfo] = []
     for key in sorted(groups):
-        candidates = candidates_for(groups[key])
+        candidates = controller_candidates(groups[key])
         result.append(candidates[0])
     return result
 
 
+def _transport_rank(info: HidDeviceInfo) -> int:
+    """同一只手柄同时出现在多个总线上时，该优先用哪条链路。
+
+    目的首先是**确定性**：两条链路都在线时若排序不稳，每轮扫描都会认为
+    "HID 路径变了"并重启读取线程，界面会跟着抖。
+
+    优先级按**实测证据**定，不是一刀切：
+
+    * **DualSense**：USB 优先。真机实测插着 USB 充电时 USB 报告能给出正确
+      等级（如"65% 充电中"），有线链路也更稳。
+    * **DualShock 4**：**蓝牙优先**。真机实测（CUH-ZCT2）它一插上 USB，
+      USB 报告的低 4 位就**恒定**报 11（"充电中"标记，不含等级，见
+      :func:`parsers.interpret_ds4`）；真实等级只在**蓝牙**链路那些
+      "未插线"的帧里出现（充电器脉冲间隙）。走蓝牙才能显示真实电量。
+
+    另一条链路仍留在候选列表里，当前链路打不开时会自动回落
+    （见 :func:`all_candidates_for`）。
+    """
+    spec = registry.lookup(info.vendor_id, info.product_id)
+    family = spec.family if spec else ""
+    if family == FAMILY_DUALSENSE:
+        order = (Transport.USB, Transport.BLUETOOTH)
+    else:
+        order = (Transport.BLUETOOTH, Transport.USB)
+    return order.index(info.transport) if info.transport in order else len(order)
+
+
 def candidates_for(infos: List[HidDeviceInfo]) -> List[HidDeviceInfo]:
     """把同一物理设备的多个集合排好序，最优的候选排最前。"""
-    return sorted(infos, key=lambda i: (_collection_rank(i), i.usage_page, i.usage))
+    return sorted(infos, key=lambda i: (_transport_rank(i), _collection_rank(i),
+                                        i.usage_page, i.usage))
+
+
+def is_controller_collection(info: HidDeviceInfo) -> bool:
+    """这个 HID 集合有可能**是游戏手柄**吗。
+
+    用的是**黑名单**（只排除"确定不是手柄"的集合），不是白名单 —— 错杀会让
+    一台正常手柄从界面上整个消失，代价远大于多留一个可疑集合（后者由
+    :func:`_collection_rank` 排序处理，主集合仍然排最前）。
+
+    要排除的是触控板附带的集合。真机实测 DualSense 走 USB 适配器时::
+
+        up=1  u=5   Game Pad           ← 主集合，保留
+        up=1  u=6   Keyboard           ← 排除
+        up=12 u=1   Consumer Control   ← 排除
+        up=1  u=2   Mouse              ← 排除
+
+    注意**不能**用白名单（只认 Game Pad）：蓝牙连接的 DS4 报的是
+    ``up=0 u=0``（hidapi 没能给出 usage），白名单会把它一起筛掉。
+    """
+    if info.usage_page == 0x01:                      # Generic Desktop
+        # Pointer / Mouse / Keyboard / Keypad 确定不是游戏手柄
+        return info.usage not in (0x01, 0x02, 0x06, 0x07)
+    if info.usage_page in (0x0B, 0x0C):              # Telephony / Consumer
+        return False
+    return True                                      # 其余（含 up=0 的未知）放行
+
+
+def controller_candidates(infos: List[HidDeviceInfo]) -> List[HidDeviceInfo]:
+    """优先挑"像手柄"的集合；**一个都不像时宁可不筛**（不能把设备弄丢）。"""
+    picked = [i for i in infos if is_controller_collection(i)]
+    return candidates_for(picked or infos)
 
 
 def all_candidates_for(vendor_id: int, product_id: int, device_key: str) -> List[HidDeviceInfo]:
@@ -218,7 +292,9 @@ def all_candidates_for(vendor_id: int, product_id: int, device_key: str) -> List
         i for i in (enumerate_all() or [])
         if i.vendor_id == vendor_id and i.product_id == product_id and i.device_key == device_key
     ]
-    return candidates_for(infos)
+    # 备用候选同样只取"像手柄"的集合：触控板的键鼠集合即使能打开也读不到电量，
+    # 让主集合失败后回落到它们只会得到无意义的读数。
+    return controller_candidates(infos)
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +430,110 @@ def request_ds4_full_report_mode(handle: HidHandle, transport: Transport) -> boo
 def dualsense_firmware_info(handle: HidHandle) -> Optional[bytes]:
     """读取 DualSense 固件信息（0x20，64 字节）—— 仅用于排障日志。"""
     return handle.get_feature_report(0x20, 64)
+
+
+# ---------------------------------------------------------------------------
+# 手柄自己的 MAC：跨总线识别"同一台手柄"
+# ---------------------------------------------------------------------------
+# 为什么需要：手柄**蓝牙连着时插上 USB 线**，Windows 会同时暴露两条 HID 设备
+# （蓝牙一条、USB 一条），两者的分组键天然不同 → 界面里同一只手柄出现两条。
+# 能跨总线对齐的只有手柄自己的 MAC。
+#
+# 两条来源（内核 hid-playstation.c 就是这么做的）：
+#   * 蓝牙：设备唯一串，对应 hidapi 的 serial_number，本身就是 MAC；
+#   * USB ：serial_number 常常是空的，得读**配对信息特性报告**
+#           （DualSense = 0x09 / DualShock 4 = 0x12），MAC 在小端序的 [1..6]。
+#
+# 真机验证（DualSense，USB 与蓝牙同时连着）：
+#   特性报告 0x09 = 09 4E B3 82 56 27 0C ...  → 反转 → 0c275682b34e
+#   蓝牙侧 serial_number = '0c275682b34e'              一致 ✓
+
+_mac_cache: Dict[object, Optional[str]] = {}
+_MAC_MISS = object()
+
+
+def _collections_of(info: HidDeviceInfo) -> List[HidDeviceInfo]:
+    """同一个**物理设备**下的所有集合，按"最像手柄"的顺序排。
+
+    为什么要一起看：一个手柄会暴露多个 HID 集合（主游戏控制器 + 触控板的
+    键鼠集合）。配对信息特性报告只有主集合（或其中一部分）能读，
+    只拿手上这一个集合去读，可能"恰好读不到"。
+    """
+    try:
+        all_dev = enumerate_all() or []
+    except Exception:
+        return [info]
+    anchor = physid.physical_device_id(info.path)
+    group = [d for d in all_dev
+             if d.vendor_id == info.vendor_id and d.product_id == info.product_id
+             and (physid.physical_device_id(d.path) or d.path) == (anchor or info.path)]
+    return candidates_for(group) or [info]
+
+
+def _read_pairing_mac(info: HidDeviceInfo) -> Optional[str]:
+    entry = physid.PAIRING_REPORT.get(info.product_id)
+    if entry is None:
+        return None
+    report_id, length = entry
+    handle = HidHandle(info)
+    try:
+        if not handle.open():
+            return None
+        payload = handle.get_feature_report(report_id, length)
+    except Exception as exc:                       # 读不到不算错误，只是没标识
+        log.debug("读取配对信息特性报告失败（%s）：%s", info, exc)
+        return None
+    finally:
+        try:
+            handle.close()
+        except Exception:
+            pass
+    mac = physid.mac_from_feature_report(payload)
+    if mac:
+        log.debug("从特性报告 0x%02X 取到手柄 MAC：%s", report_id, mac)
+    return mac
+
+
+def controller_mac(info: HidDeviceInfo) -> Optional[str]:
+    """返回手柄自己的 MAC（12 位小写十六进制），拿不到返回 ``None``。
+
+    .. important::
+       **缓存单位是"物理设备"，不是单个集合。** 一个手柄的多个集合必须共用
+       同一个结果 —— 否则会出现"主集合拿到了 MAC、触控板集合没拿到"，
+       同一个手柄算出两个分组键，1.5 修掉的"一个手柄显示成好几台"就会回来。
+
+    取法（内核 hid-playstation.c 的两条来源）：
+    1. 设备唯一串 —— 蓝牙连接时 ``serial_number`` 本身就是 MAC；
+    2. 配对信息特性报告 —— USB 连接时 ``serial_number`` 是空的，
+       DualSense 用 ``0x09`` / DualShock 4 用 ``0x12``，MAC 在小端序的 ``[1..6]``。
+
+    第 2 步会按"最像手柄"的顺序**逐个集合尝试**，避免恰好拿到一个读不了的集合。
+    """
+    anchor = physid.physical_device_id(info.path) or info.path
+    cached = _mac_cache.get(anchor, _MAC_MISS)
+    if cached is not _MAC_MISS:
+        return cached                                  # type: ignore[return-value]
+
+    mac = None
+    for cand in _collections_of(info):
+        mac = physid.normalize_mac(cand.serial)
+        if mac:
+            break
+    if mac is None:
+        for cand in _collections_of(info):
+            mac = _read_pairing_mac(cand)
+            if mac:
+                break
+
+    if len(_mac_cache) > 64:                           # 防止无界增长
+        _mac_cache.clear()
+    _mac_cache[anchor] = mac
+    return mac
+
+
+def clear_mac_cache() -> None:
+    """清空 MAC 缓存（测试用）。"""
+    _mac_cache.clear()
 
 
 # ---------------------------------------------------------------------------

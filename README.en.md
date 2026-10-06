@@ -76,6 +76,7 @@ Output: `Release\PSBatteryTray.exe`. Tests: `python tests\run_tests.py` (96 test
 
 | Document | Contents |
 |---|---|
+| [CHANGELOG.md](CHANGELOG.md) | **Releases 1.4 → 1.8, Chinese/English pairs** |
 | [docs/USAGE.md](docs/USAGE.md) | Detailed usage, full config reference, known issues, changelog (**Chinese**) |
 | [docs/TECHNICAL_FEASIBILITY.md](docs/TECHNICAL_FEASIBILITY.md) | Protocol notes, byte-offset derivations, feasibility study (**Chinese**) |
 

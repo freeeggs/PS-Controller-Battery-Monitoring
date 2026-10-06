@@ -178,8 +178,49 @@ def level_to_percent(level: int) -> int:
 # ---------------------------------------------------------------------------
 # 解释函数
 # ---------------------------------------------------------------------------
+def peek_battery_byte(family: str, transport: Transport,
+                      buf: bytes) -> Optional[int]:
+    """**只读出一个字节**：这一帧里的电量/状态字节（不做任何解释）。
+
+    给读取循环做节流判断用：电量字节一变就立刻解析，不必等节流窗口
+    （见 :meth:`Manager._Reader._loop`）。读不到返回 ``None``。
+    """
+    size = len(buf)
+    if family == FAMILY_DUALSENSE:
+        if transport == Transport.BLUETOOTH:
+            if buf[0] == DS_REPORT_BT and size >= DS_BT_BATTERY_INDEX + 1:
+                return buf[DS_BT_BATTERY_INDEX]
+            return None
+        if buf[0] == DS_REPORT_USB and size >= DS_USB_BATTERY_INDEX + 1:
+            return buf[DS_USB_BATTERY_INDEX]
+        return None
+    if transport == Transport.BLUETOOTH:
+        if buf[0] == 0x11 and size >= DS4_BT_BATTERY_INDEX + 1:
+            return buf[DS4_BT_BATTERY_INDEX]
+        return None
+    if buf[0] == 0x01 and size >= DS4_USB_BATTERY_INDEX + 1:
+        return buf[DS4_USB_BATTERY_INDEX]
+    return None
+
+
 def interpret_ds4(raw: int) -> BatteryReport:
-    """解释 DualShock 4 的电量字节 ``status[0]``。"""
+    """解释 DualShock 4 的电量字节 ``status[0]``。
+
+    .. important::
+       **插线时的低 4 位 ``11`` 不是电量。** 内核 ``hid-playstation.c`` 把它
+       注释成"battery is full"，照抄会得到一个**假读数**。真机实测
+       （CUH-ZCT2，2026-10-05）：
+
+       * 未插线：``0x08`` → 低 4 位 8 = 约 85%（真实电量）
+       * 一插上 USB：立刻变成 ``0x1B``（低 4 位 = 11，bit4 = 插线）
+         **并一直保持**，无论电量是 85% 还是别的值
+       * 充电期间偶尔会插进来一帧"未插线"的 ``0x08``（充电器脉冲间隙），
+         那才是真实的等级
+
+       所以这里对"插线 + 11"只声明**正在充电**、不给等级；等级由真正带等级的
+       帧决定，管理器会把上一次真实等级沿用到充电状态里
+       （见 :meth:`Manager._update_battery`），既不会假报 100%，也不会闪烁。
+    """
     capacity = raw & BATTERY_CAPACITY_MASK
     cable = bool(raw & DS4_CABLE_STATE_BIT)
 
@@ -190,13 +231,16 @@ def interpret_ds4(raw: int) -> BatteryReport:
         if capacity == 10:
             return BatteryReport(10, 100, ChargeState.CHARGING, SRC_DS4_USB, raw)
         if capacity == DS4_STATUS_FULL:
-            return BatteryReport(10, 100, ChargeState.FULL, SRC_DS4_USB, raw)
-        # 14 / 15 及其它未定义值：电压或温度异常、充电错误
+            # 内核叫它"已充满"，真机证明那只表示"插着线在充电"。
+            # 只报状态、不报等级 —— 否则充电时会显示假的 100%。
+            return BatteryReport(None, None, ChargeState.CHARGING, SRC_DS4_USB, raw)
+        # 14 电压/温度异常未充电、15 充电错误、以及保留值
         return BatteryReport(None, None, ChargeState.ERROR, SRC_DS4_USB, raw)
 
-    # 未插线（蓝牙或纯无线 USB 适配器供电）
-    level = min(capacity, 10)
-    return BatteryReport(level, level_to_percent(level), ChargeState.DISCHARGING,
+    # 未插线：0~10 才是等级；11 及以上是未定义值（不能当成 100%）
+    if capacity > 10:
+        return BatteryReport(None, None, ChargeState.DISCHARGING, SRC_DS4_USB, raw)
+    return BatteryReport(capacity, level_to_percent(capacity), ChargeState.DISCHARGING,
                          SRC_DS4_USB, raw)
 
 
@@ -247,12 +291,32 @@ def parse_report(
 
 def _parse_dualsense(transport: Transport, report_id: int, buf: bytes,
                      source_hint: str) -> Optional[BatteryReport]:
-    # 蓝牙
+    """解析 DualSense (PS5) 输入报告。
+
+    .. important::
+       和 DS4 同一个道理：**报告 ID 必须与连接方式一起判断**。
+       DualSense 的完整报告在 USB 上是 **0x01**（64B）、蓝牙上是 **0x31**（78B，
+       两者电量都落在下标 53）。
+
+       真机踩过的坑（2026-10-05 复现）：蓝牙接入瞬间收到一条 **0x01**、长度
+       64 字节的报告，前 6 字节是合法摇杆数据、**下标 8 起全是 0**。旧代码
+       没看 transport，直接按 USB 报告读下标 53 = ``0x00`` → "0 档 / 约 5%"
+       → 立刻弹了一次**严重低电量**提醒（几分钟后才被真正的 0x31 纠正）。
+
+       所以这里有两道闸：**蓝牙下的 0x01 一律不是完整报告**；**报告体为空的
+       0x01 在任何总线上一律不可信**（USB 下也会收到这种空壳，见
+       :func:`_body_is_empty`，那是"断开连接时误报 5%"的来源）。
+    """
+    # 蓝牙完整报告
     if report_id == DS_REPORT_BT and len(buf) >= _DS_MIN_LEN_BT:
         report = interpret_dualsense(buf[DS_BT_BATTERY_INDEX])
         return _with_source(report, SRC_DS_BT, buf, source_hint)
-    # USB
+    # 0x01：只有总线明确是 USB、且报告体非空时才算完整报告
     if report_id == DS_REPORT_USB and len(buf) >= _DS_MIN_LEN_USB:
+        if transport == Transport.BLUETOOTH:
+            return _minimal_report(buf)
+        if _body_is_empty(buf):
+            return _minimal_report(buf)
         report = interpret_dualsense(buf[DS_USB_BATTERY_INDEX])
         return _with_source(report, SRC_DS_USB, buf, source_hint)
     # 报告 ID 与长度都对不上：交给调用方记录原始报告
@@ -273,18 +337,28 @@ def _minimal_report(buf: bytes) -> BatteryReport:
     )
 
 
-def _looks_like_padded_minimal(buf: bytes) -> bool:
-    """报告是不是「蓝牙精简报告被补齐到 64 字节」。
+def _body_is_empty(buf: bytes) -> bool:
+    """报告是不是个"空壳"：第 10 字节起全是 0。
 
-    只在**无法判定连接方式**时用作保险。判据：第 10 字节往后全是 0。
+    .. important::
+       **光看报告 ID 和长度分不出真假**，必须看报告体。三份真机日志里的
+       原样字节（都是同一个坑）：
 
-    真机证据（DS4 CUH-ZCT2 蓝牙接入瞬间的第一条报告）::
+       .. code-block:: text
 
-        01 78 7A 7C 84 08 00 00 00 00 ... 00     (64B，下标 30 是填充的 0x00)
+          # 正常 USB 报告（DualSense）：下标 12 起是陀螺仪/时间戳/计数器
+          01 7F 80 7F 7C 00 00 01 08 00 00 00 99 6E 92 8E 00 00 00 00 FF FF ...
+          # 连接/断开瞬间的空壳报告（DualSense，USB 与蓝牙都出现过）
+          01 80 80 83 7D 08 00 10 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ...
+          # 蓝牙精简报告被补齐到 64 字节（DS4）
+          01 78 7A 7C 84 08 00 00 00 00 00 00 00 00 00 00 ...
 
-    精简报告只有前 10 字节有意义（摇杆 + 按键），补齐部分必然是 0；
-    而真正的 USB 完整报告里，偏移 9 起是数据包计数器、12 起是陀螺仪/加速度计，
-    这些字段**不可能**整段为 0。
+       三种前几个字节都是**合法的摇杆/按键数据**，长度也够（≥31 / ≥64），
+       按"ID + 长度"分发全都会被当成完整报告；但后两种的**报告体是空的**。
+
+       空报告体不可能是真实读数：电量下标（DS4=30 / DualSense=53）上全是
+       填充的 ``0x00``，照读就是"0 档 / 约 5%"，并立刻误报一次**严重低电量**。
+       真正的完整报告里，下标 12 起是陀螺仪与时间戳，**不可能**整段为 0。
     """
     return len(buf) >= 11 and not any(buf[10:])
 
@@ -320,17 +394,11 @@ def _parse_ds4(transport: Transport, report_id: int, buf: bytes,
             return _minimal_report(buf)
         return None
 
-    # USB（或无法判定连接方式）：0x01 是完整报告，电量在下标 30
-    #
-    # 连接方式为 UNKNOWN 时多一道保险：报告体若为空（第 10 字节起全 0），
-    # 按蓝牙精简报告处理。原因见 _looks_like_padded_minimal 的注释 ——
-    # 蓝牙栈会把 10 字节精简报告补齐到 64 字节，只看 ID 和长度会读出假的 5%。
+    # USB（或无法判定连接方式）：0x01 是完整报告，电量在下标 30。
+    # 但**报告体为空的 0x01 一律不可信**（连接/断开瞬间的空壳报告），
+    # 见 _body_is_empty 的注释。
     if report_id == DS4_REPORT_USB and size >= _DS4_MIN_LEN_USB:
-        if transport == Transport.UNKNOWN and _looks_like_padded_minimal(buf):
-            # 总线未知时的保险：这条报告体是空的，极可能就是蓝牙精简报告被
-            # 补齐到 64 字节。宁可显示"电量未知"，也不能再次踩到本项目已经
-            # 明确修过的"读下标 30 得到假的 0 档 / 约 5%"。
-            # （返回的 source 会标成精简报告，日志里一眼能看出来。）
+        if _body_is_empty(buf):
             return _minimal_report(buf)
         report = interpret_ds4(buf[DS4_USB_BATTERY_INDEX])
         return _with_source(report, SRC_DS4_USB, buf, source_hint)

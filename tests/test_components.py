@@ -753,6 +753,580 @@ class StaleBatteryTests(unittest.TestCase):
         self.assertEqual(record.view.percent, 75)
 
 
+class CompositeDeviceTests(unittest.TestCase):
+    """复合设备（USB 无线适配器）不得把一个手柄显示成好几台。
+
+    真机数据（DualSense 走 USB 适配器）：一个手柄暴露 4 个 HID 集合::
+
+        up=1  u=5   Game Pad          ← 真正的主集合（能读到电量）
+        up=1  u=6   Keyboard          ┐ 触控板附带的
+        up=12 u=1   Consumer Control  ├ 三个集合，
+        up=1  u=2   Mouse             ┘ 永远不会带电量
+
+    它们分属 ``MI_03`` / ``MI_04`` 两个接口，HID 实例段也各不相同
+    （``&0000`` / ``&0001`` / ``&0002``），所以按 HID 路径分组会得到 4 台设备 ——
+    界面上就是"一台 75% + 三台电量未知"。
+    """
+
+    #: 真机抓到的 4 条路径（原样保留，回归测试直接用它们）
+    REAL_PATHS = [
+        (r"\\?\HID#VID_054C&PID_0CE6&MI_03#9&22b58c18&0&0000"
+         r"#{4d1e55b2-f16f-11cf-88cb-001111000030}", 0x01, 0x05, 3),
+        (r"\\?\HID#VID_054C&PID_0CE6&MI_04&Col01#9&6a2d811&0&0000"
+         r"#{4d1e55b2-f16f-11cf-88cb-001111000030}\KBD", 0x01, 0x06, 4),
+        (r"\\?\HID#VID_054C&PID_0CE6&MI_04&Col02#9&6a2d811&0&0001"
+         r"#{4d1e55b2-f16f-11cf-88cb-001111000030}", 0x0C, 0x01, 4),
+        (r"\\?\HID#VID_054C&PID_0CE6&MI_04&Col03#9&6a2d811&0&0002"
+         r"#{4d1e55b2-f16f-11cf-88cb-001111000030}", 0x01, 0x02, 4),
+    ]
+
+    def _infos(self):
+        from psbt.controllers.backend import HidDeviceInfo
+
+        return [
+            HidDeviceInfo(
+                path=p.encode(), vendor_id=0x054C, product_id=0x0CE6,
+                product_string="DualSense Wireless Controller",
+                usage_page=up, usage=u, interface_number=iface, bus_type=1,
+            )
+            for (p, up, u, iface) in self.REAL_PATHS
+        ]
+
+    def test_touchpad_collections_are_not_controllers(self):
+        from psbt.controllers import backend
+
+        verdicts = [(i.usage_page, i.usage, backend.is_controller_collection(i))
+                    for i in self._infos()]
+        self.assertTrue(verdicts[0][2], "Game Pad 集合必须被认作手柄")
+        self.assertFalse(verdicts[1][2], "键盘集合不是手柄")
+        self.assertFalse(verdicts[2][2], "消费类集合不是手柄")
+        self.assertFalse(verdicts[3][2], "鼠标集合不是手柄")
+
+    def test_bluetooth_ds4_undefined_collection_is_kept(self):
+        """蓝牙 DS4 报的是 up=0 u=0（未定义），不能被筛掉。"""
+        from psbt.controllers.backend import HidDeviceInfo, is_controller_collection
+
+        info = HidDeviceInfo(path=b"x", vendor_id=0x054C, product_id=0x09CC,
+                             usage_page=0, usage=0, bus_type=2)
+        self.assertTrue(is_controller_collection(info))
+
+    def test_controller_candidates_drops_phantoms(self):
+        from psbt.controllers import backend
+
+        cands = backend.controller_candidates(self._infos())
+        self.assertEqual(len(cands), 1, "只剩主集合")
+        self.assertEqual((cands[0].usage_page, cands[0].usage), (0x01, 0x05))
+
+    def test_controller_candidates_never_empties_a_device(self):
+        """一个集合都不像手柄时不许把设备筛没（宁可保留原样）。"""
+        from psbt.controllers import backend
+
+        infos = [i for i in self._infos() if i.usage_page == 0x0C]
+        cands = backend.controller_candidates(infos)
+        self.assertEqual(len(cands), 1)
+
+    def test_physical_device_id_merges_interfaces(self):
+        """4 个集合必须归到同一个物理设备。"""
+        from psbt.controllers import physid
+
+        ids = {physid.physical_device_id(i.path) for i in self._infos()}
+        if ids == {None}:
+            self.skipTest("本机取不到物理设备 ID（cfgmgr32 不可用或非 Windows）")
+        self.assertEqual(len(ids), 1, "同一手柄的多个接口应归为一台：%s" % ids)
+        self.assertTrue(list(ids)[0].upper().startswith("USB\\"))
+
+    def test_device_key_groups_by_physical_device(self):
+        """device_key 必须一致 —— 这是界面只显示一台的关键。"""
+        from psbt.controllers import backend, physid
+        from psbt.controllers.models import Transport
+
+        infos = self._infos()
+        if physid.physical_device_id(infos[0].path) is None:
+            self.skipTest("本机取不到物理设备 ID")
+        keys = {i.device_key for i in infos}
+        self.assertEqual(len(keys), 1, "4 个集合应共用一个 device_key：%s" % keys)
+
+    def test_device_key_falls_back_to_instance_segment(self):
+        """MAC 与物理设备都拿不到时，回退到 HID 实例段（行为与旧版一致）。"""
+        from psbt.controllers import backend, physid
+
+        infos = self._infos()
+        orig_phys = physid.physical_device_id
+        orig_mac = backend.controller_mac
+        try:
+            physid.physical_device_id = lambda path: None
+            backend.controller_mac = lambda info: None
+            backend.clear_mac_cache()
+            keys = [i.device_key for i in infos]
+        finally:
+            physid.physical_device_id = orig_phys
+            backend.controller_mac = orig_mac
+            backend.clear_mac_cache()
+        self.assertEqual(len(set(keys)), 4, "回退后每集合各成一组（旧行为）")
+        for k in keys:
+            self.assertIn("&", k.split("#")[-1])
+
+    def test_mac_is_resolved_once_per_physical_device(self):
+        """★ MAC 必须**按物理设备**解析，不是按集合。
+
+        曾经的实现按设备路径缓存，于是可能出现"主集合读到了 MAC、触控板集合
+        没读到" —— 同一个手柄算出两个分组键，1.5 修掉的"一个手柄显示成好几台"
+        就会回来。这里让除主集合外的路径都打不开，四个集合仍必须共用同一个 key。
+
+        .. note::
+           物理设备 ID 显式打桩：真实路径对应的是**上一次**插拔的 devnode，
+           机器状态一变结果就不同，测试不能依赖它。
+        """
+        from psbt.controllers import backend, physid
+
+        infos = self._infos()
+        payload = bytes.fromhex("09 4E B3 82 56 27 0C 08 25 00 DA 47 64 28 AF 44 00 00 00 00")
+        opened = []
+
+        class _FakeHandle:
+            def __init__(self, info):
+                self.info = info
+
+            def open(self):
+                # 只有主游戏控制器集合（MI_03）能打开
+                ok = b"MI_03" in self.info.path
+                opened.append(ok)
+                return ok
+
+            def get_feature_report(self, report_id, length=64):
+                return payload if report_id == 0x09 else None
+
+            def close(self):
+                pass
+
+        orig_handle = backend.HidHandle
+        orig_phys = physid.physical_device_id
+        try:
+            backend.HidHandle = _FakeHandle
+            physid.physical_device_id = lambda path: r"USB\VID_054C&PID_0CE6\STUB"
+            backend.clear_mac_cache()
+            keys = {i.device_key for i in infos}
+        finally:
+            backend.HidHandle = orig_handle
+            physid.physical_device_id = orig_phys
+            backend.clear_mac_cache()
+        self.assertEqual(len(keys), 1,
+                         "四个集合必须共用一个 key：%s" % keys)
+        self.assertIn("MAC:0c275682b34e", keys.pop())
+
+    def test_hid_instance_id_parsing(self):
+        from psbt.controllers import physid
+
+        self.assertEqual(
+            physid.hid_instance_id(self.REAL_PATHS[1][0]),
+            r"HID\VID_054C&PID_0CE6&MI_04&Col01\9&6a2d811&0&0000")
+        self.assertEqual(
+            physid.hid_instance_id(rb"\\?\HID#VID_054C&PID_09CC#7&abc&0&0000#{g}"),
+            "HID\\VID_054C&PID_09CC\\7&abc&0&0000")
+        self.assertIsNone(physid.hid_instance_id("not-a-hid-path"))
+        self.assertIsNone(physid.hid_instance_id(b""))
+
+    def test_hub_and_interface_nodes_are_not_devices(self):
+        from psbt.controllers import physid
+
+        # 接口节点
+        self.assertFalse(physid._is_physical_usb_device(          # noqa: SLF001
+            r"USB\VID_054C&PID_0CE6&MI_04\8&1DF12F96&1&0004"))
+        # HUB 节点
+        self.assertFalse(physid._is_physical_usb_device(          # noqa: SLF001
+            r"USB\ROOT_HUB30\5&201A262C&0&0"))
+        self.assertFalse(physid._is_physical_usb_device(          # noqa: SLF001
+            r"USB\VID_1A40&PID_0101\6&28CF390B&0&12"))
+        # 蓝牙节点
+        self.assertFalse(physid._is_physical_usb_device(          # noqa: SLF001
+            r"BTHENUM\{00001124-0000-1000-8000-00805f9b34fb}_VID&0002054c_PID&09cc\7&a&0&0000"))
+        # 真设备
+        self.assertTrue(physid._is_physical_usb_device(           # noqa: SLF001
+            r"USB\VID_054C&PID_0CE6\1C784B8B409B0000"))
+
+    def test_bluetooth_parent_chain_never_reaches_the_radio(self):
+        """★ 关键防线：蓝牙设备的父链上出现非 USB 节点时必须立刻停手。
+
+        否则会一路爬到**蓝牙适配器**（它本身挂在 USB 总线上），
+        把同一台机器的所有蓝牙手柄并成一台 —— 比多几个幽灵条目严重得多。
+        """
+        from psbt.controllers import physid
+
+        self.assertFalse(physid._is_usb_node(                     # noqa: SLF001
+            r"BTHENUM\{00001124-0000-1000-8000-00805f9b34fb}_VID&0002054c_PID&09cc\7&a&0&0000"))
+        self.assertFalse(physid._is_usb_node(r"BTHLE\DEV_1234\7&a&0&0000"))   # noqa: SLF001
+        self.assertTrue(physid._is_usb_node(                      # noqa: SLF001
+            r"USB\VID_8087&PID_0026\5&1&0&1"))
+
+
+class SameControllerTwoTransportsTests(unittest.TestCase):
+    """同一只手柄同时出现在两个总线上，只能显示一条。
+
+    真机场景（用户反馈）：手柄**蓝牙连着时插上 USB 线**，Windows 会同时暴露
+    两条 HID 设备，两条都能打开——
+
+    .. code-block:: text
+
+       12:54:54  检测到手柄：DualSense [蓝牙 / 054C:0CE6#\\?\\HID]
+       12:55:01  检测到手柄：DualSense [USB / 054C:0CE6#USB\\VID_054C&PID_0CE6\\6&1B0A3985&0&2]
+
+    ——界面里同一只手柄出现两条。两条的分组键天然不同，能跨总线对齐它们的
+    只有**手柄自己的 MAC**：蓝牙侧 hidapi 的 ``serial_number`` 就是 MAC，
+    USB 侧 ``serial_number`` 是空的、得读配对信息特性报告。
+
+    下面的字节都是真机抓到的原样数据（DualSense，USB 与蓝牙同时连着）。
+    """
+
+    #: 真机特性报告 0x09（USB 侧读到的，MAC 小端序存在 [1..6]）
+    REAL_PAIRING = bytes.fromhex("09 4E B3 82 56 27 0C 08 25 00 DA 47 64 28 AF 44 00 00 00 00")
+    #: 蓝牙侧 hidapi 给的 serial_number
+    REAL_BT_SERIAL = "0c275682b34e"
+    #: USB 侧真实路径（serial 为空）
+    USB_PATH = (r"\\?\HID#VID_054C&PID_0CE6&MI_03#8&e44178f&0&0000"
+                r"#{4d1e55b2-f16f-11cf-88cb-001111000030}").encode()
+    #: 蓝牙侧真实路径
+    BT_PATH = (r"\\?\HID#{00001124-0000-1000-8000-00805f9b34fb}"
+               r"_VID&0002054c_PID&0ce6#9&1934ba94&1&0000"
+               r"#{4d1e55b2-f16f-11cf-88cb-001111000030}").encode()
+
+    def setUp(self):
+        from psbt.controllers import backend
+
+        self.backend = backend
+        # 保存原对象：下面的替身会覆盖模块级名字，必须还原，
+        # 否则会污染后面的测试（读取线程会拿到不会 read 的假句柄）。
+        self._orig_handle = backend.HidHandle
+        backend.clear_mac_cache()
+
+    def tearDown(self):
+        self.backend.HidHandle = self._orig_handle
+        self.backend.clear_mac_cache()
+
+    def _info(self, path, bus_type, serial=""):
+        from psbt.controllers.backend import HidDeviceInfo
+
+        return HidDeviceInfo(
+            path=path, vendor_id=0x054C, product_id=0x0CE6,
+            product_string="DualSense Wireless Controller",
+            serial=serial, usage_page=1, usage=5, interface_number=-1,
+            bus_type=bus_type)
+
+    def _stub_feature_reads(self):
+        """把打开设备/读特性报告换成返回真机字节，测试不碰硬件。"""
+        payload = self.REAL_PAIRING
+        opened = []
+
+        class _FakeHandle:
+            def __init__(self, info):
+                self.info = info
+
+            def open(self):
+                opened.append(self.info.path)
+                return True
+
+            def get_feature_report(self, report_id, length=64):
+                return payload if report_id == 0x09 else None
+
+            def close(self):
+                pass
+
+        self.backend.HidHandle = _FakeHandle
+        return opened
+
+    # ---- 纯函数 ----------------------------------------------------------
+    def test_normalize_mac_variants(self):
+        from psbt.controllers import physid
+
+        for text in ("0c275682b34e", "0C275682B34E", "0c:27:56:82:b3:4e",
+                     "0C-27-56-82-B3-4E", "  0c275682b34e  "):
+            self.assertEqual(physid.normalize_mac(text), "0c275682b34e", text)
+        for bad in ("", None, "0c275682b3", "not-a-mac", "0c275682b34e00"):
+            self.assertIsNone(physid.normalize_mac(bad), bad)
+
+    def test_mac_from_feature_report_is_little_endian(self):
+        """特性报告里的 MAC 是**小端序**，必须反过来读。
+
+        内核结构体注释：``u8 mac_address[6]; /* Note: stored in little
+        endian order. */`` —— 真机字节 4E B3 82 56 27 0C 对应
+        0C:27:56:82:B3:4E。
+        """
+        from psbt.controllers import physid
+
+        self.assertEqual(physid.mac_from_feature_report(self.REAL_PAIRING),
+                         "0c275682b34e")
+        self.assertIsNone(physid.mac_from_feature_report(b""))
+        self.assertIsNone(physid.mac_from_feature_report(b"\x09\x01\x02"))
+
+    # ---- 采集 MAC --------------------------------------------------------
+    def test_mac_from_bluetooth_serial(self):
+        info = self._info(self.BT_PATH, bus_type=2, serial=self.REAL_BT_SERIAL)
+        self.assertEqual(self.backend.controller_mac(info), "0c275682b34e")
+
+    def test_mac_from_usb_feature_report(self):
+        """USB 侧 serial 为空，靠特性报告取 MAC。"""
+        self._stub_feature_reads()
+        info = self._info(self.USB_PATH, bus_type=1, serial="")
+        self.assertEqual(self.backend.controller_mac(info), "0c275682b34e")
+
+    def test_mac_read_is_cached_per_path(self):
+        opened = self._stub_feature_reads()
+        info = self._info(self.USB_PATH, bus_type=1, serial="")
+        self.backend.controller_mac(info)
+        self.backend.controller_mac(info)
+        self.assertEqual(len(opened), 1, "同一条路径只该读一次")
+
+    # ---- ★ 核心：两条总线必须归成一台 -----------------------------------
+    def test_usb_and_bt_share_one_device_key(self):
+        """★ 用户报的 bug：蓝牙 + USB 同时连着，界面出现两条。
+
+        两个集合的分组键必须相同 —— 这正是界面只显示一条的关键。
+        """
+        self._stub_feature_reads()
+        usb = self._info(self.USB_PATH, bus_type=1, serial="")
+        bt = self._info(self.BT_PATH, bus_type=2, serial=self.REAL_BT_SERIAL)
+        self.assertEqual(usb.device_key, bt.device_key,
+                         "同一只手柄的两条总线必须共用一个 device_key")
+        self.assertIn("MAC:0c275682b34e", usb.device_key)
+
+    def test_different_controllers_are_not_merged(self):
+        """护栏：两只**不同**的手柄不能被并成一台。"""
+        payload = bytearray(self.REAL_PAIRING)
+        payload[1:7] = bytes.fromhex("11 22 33 44 55 66")      # 另一台手柄
+        self._stub_feature_reads()
+        self.backend.HidHandle.get_feature_report = (
+            lambda self_, rid, length=64: bytes(payload) if rid == 0x09 else None)
+        a = self._info(self.USB_PATH, bus_type=1, serial="")
+        b = self._info(self.BT_PATH, bus_type=2, serial="aabbccddeeff")
+        self.assertNotEqual(a.device_key, b.device_key)
+
+    def test_falls_back_when_mac_unavailable(self):
+        """MAC 取不到时退回原来的分组方式，不能崩、也不能变成同一台。"""
+        class _DeadHandle:
+            def __init__(self, info):
+                pass
+
+            def open(self):
+                return False
+
+            def close(self):
+                pass
+
+        self.backend.HidHandle = _DeadHandle
+        usb = self._info(self.USB_PATH, bus_type=1, serial="")
+        bt = self._info(self.BT_PATH, bus_type=2, serial="")
+        self.assertIsNone(self.backend.controller_mac(usb))
+        self.assertIsNone(self.backend.controller_mac(bt))
+        self.assertNotEqual(usb.device_key, bt.device_key)
+        self.assertNotIn("MAC:", usb.device_key)
+
+    def test_usb_is_preferred_for_dualsense(self):
+        """DualSense 两条总线都在时**确定性地 USB 优先**。
+
+        否则每轮扫描都可能认为"HID 路径变了"并重启读取线程，界面会抖。
+        真机实测 DualSense 走 USB 充电时能给出正确等级（如"65% 充电中"）。
+        """
+        self._stub_feature_reads()
+        usb = self._info(self.USB_PATH, bus_type=1, serial="")
+        bt = self._info(self.BT_PATH, bus_type=2, serial=self.REAL_BT_SERIAL)
+        for order in ([usb, bt], [bt, usb]):          # 两种输入顺序结果一致
+            picked = self.backend.controller_candidates(order)
+            self.assertEqual(picked[0].transport.label, "USB")
+            self.assertEqual(len(picked), 2, "蓝牙那条要留作兜底")
+
+    def test_bluetooth_is_preferred_for_ds4(self):
+        """DS4 反过来：**蓝牙优先**。
+
+        真机实测（CUH-ZCT2）：它一插上 USB，USB 报告的 status[0] 就恒定报
+        0x1B（"充电中"标记，不含等级）；真实等级只在**蓝牙**链路那些"未插线"
+        的帧里出现。走 USB 的话充电期间就永远看不到电量。
+        """
+        from psbt.controllers.backend import HidDeviceInfo
+
+        def ds4(path, bus_type, serial=""):
+            return HidDeviceInfo(
+                path=path, vendor_id=0x054C, product_id=0x09CC,
+                product_string="DualShock 4 (CUH-ZCT2)", serial=serial,
+                usage_page=1, usage=5, interface_number=-1, bus_type=bus_type)
+
+        usb = ds4(self.USB_PATH, 1)
+        bt = ds4(self.BT_PATH, 2, serial="28c13c8852c4")
+        for order in ([usb, bt], [bt, usb]):
+            picked = self.backend.controller_candidates(order)
+            self.assertEqual(picked[0].transport.label, "蓝牙")
+            self.assertEqual(len(picked), 2, "USB 那条要留作兜底")
+
+
+class DS4ChargingCarryForwardTests(unittest.TestCase):
+    """插线后读到"不带电量的充电帧"：沿用上一次真实等级。
+
+    用户症状：DS4 插上 USB 后电量从 **85% 变成 100%**。
+    真机序列（13:29:07 → 13:29:14）：
+
+    =========================  ==================  ==============
+    时间                        报告 status[0]      旧行为
+    =========================  ==================  ==============
+    13:29:07 蓝牙               0x08                85%（真实）
+    13:29:13 蓝牙               0x1B                100% ✗
+    13:29:14 USB                0x1B                100% ✗
+    =========================  ==================  ==============
+
+    0x1B（低 4 位 = 11）只是"插着线在充电"的标记，不含等级。修好之后：
+    等级沿用上一次真实读数（85%），状态改为充电中 —— 既不假报 100%，
+    也不会在"未知"与真实等级之间跳（这种帧每秒几百条）。
+    """
+
+    def _manager_with_ds4(self):
+        from psbt.controllers import backend, registry
+        from psbt.controllers.manager import ControllerManager
+        from psbt.controllers.models import FAMILY_DS4, MutableController, ControllerView
+
+        info = backend.HidDeviceInfo(
+            path=b"\\\\?\\HID#VID_054C&PID_09CC&MI_03#8&4662d51&0&0000#{g}",
+            vendor_id=0x054C, product_id=0x09CC, product_string="DualShock 4",
+            usage_page=1, usage=5, interface_number=-1, bus_type=1)
+        manager = ControllerManager(Config())
+        view = ControllerView(
+            key=info.device_key, family=FAMILY_DS4,
+            display_name=registry.lookup(0x054C, 0x09CC).name,
+            transport=info.transport, vendor_id=0x054C, product_id=0x09CC)
+        manager._records[view.key] = MutableController(view=view)   # noqa: SLF001
+        return manager, view.key
+
+    def _feed(self, manager, key, raw):
+        from psbt.controllers import parsers
+
+        manager._update_battery(                                    # noqa: SLF001
+            key, parsers.interpret_ds4(raw), bytes([raw]))
+
+    def test_85_percent_survives_plugging_in_the_cable(self):
+        manager, key = self._manager_with_ds4()
+        self._feed(manager, key, 0x08)                  # 未插线：真实 85%
+        view = manager._records[key].view               # noqa: SLF001
+        self.assertEqual(view.percent, 85)
+
+        self._feed(manager, key, 0x1B)                  # 插线：无等级的充电帧
+        view = manager._records[key].view               # noqa: SLF001
+        self.assertEqual(view.percent, 85, "不得被改写成 100%")
+        self.assertEqual(view.battery.state.value, "charging")
+
+    def test_unknown_stays_unknown_without_history(self):
+        """从没读到过真实等级时，充电帧就显示未知（不编一个 100%）。"""
+        manager, key = self._manager_with_ds4()
+        self._feed(manager, key, 0x1B)
+        view = manager._records[key].view               # noqa: SLF001
+        self.assertIsNone(view.percent)
+        self.assertEqual(view.battery.state.value, "charging")
+
+    def test_real_charging_level_overrides_carried_value(self):
+        """带等级的充电帧要照常更新（如 0x18 = 充电中 85%）。"""
+        manager, key = self._manager_with_ds4()
+        self._feed(manager, key, 0x1B)
+        self._feed(manager, key, 0x09)                  # 未插线 95%
+        self._feed(manager, key, 0x18)                  # 插线 + 等级 8
+        view = manager._records[key].view               # noqa: SLF001
+        self.assertEqual(view.percent, 85)
+        self.assertEqual(view.battery.state.value, "charging")
+
+    def test_no_alert_from_the_charging_code(self):
+        """护栏：0x1B 不得让策略认为"电量耗尽"。"""
+        from psbt.controllers.models import ControllerView
+        from psbt.notify.policy import LowBatteryPolicy
+
+        manager, key = self._manager_with_ds4()
+        self._feed(manager, key, 0x1B)
+        view = manager._records[key].view               # noqa: SLF001
+        policy = LowBatteryPolicy([30, 20, 10])
+        self.assertIsNone(policy.evaluate(view))
+
+
+class ParseThrottleTests(unittest.TestCase):
+    """节流不能让"稍纵即逝的电量帧"被漏掉。
+
+    DS4 插线后每秒几百帧都报"充电中"标记（不带等级），**真正的等级只在充电器
+    脉冲间隙那几帧里出现**（间隔几十秒、只持续几毫秒）。读取循环按 4Hz 节流
+    （`report_min_gap`），整段错过就会导致充电期间一直显示"电量未知"。
+    所以电量字节一变就必须立刻解析。
+    """
+
+    def test_peek_battery_byte_per_family_and_transport(self):
+        from psbt.controllers import parsers
+        from psbt.controllers.models import FAMILY_DS4, FAMILY_DUALSENSE, Transport
+
+        ds4_usb = bytes([0x01] + [0] * 29 + [0x1B] + [0] * 34)
+        ds4_bt = bytes([0x11, 0xC0, 0x00] + [0] * 29 + [0x08, 0]) + bytes(46)
+        ds_minimal = bytes([0x01] + [0] * 9)                  # 蓝牙精简报告
+        self.assertEqual(parsers.peek_battery_byte(FAMILY_DS4, Transport.USB, ds4_usb), 0x1B)
+        self.assertEqual(parsers.peek_battery_byte(FAMILY_DS4, Transport.BLUETOOTH, ds4_bt), 0x08)
+        self.assertIsNone(parsers.peek_battery_byte(FAMILY_DS4, Transport.BLUETOOTH, ds_minimal))
+
+        ds5 = bytearray(78)
+        ds5[0] = 0x31
+        ds5[54] = 0x16
+        self.assertEqual(parsers.peek_battery_byte(FAMILY_DUALSENSE, Transport.BLUETOOTH,
+                                                   bytes(ds5)), 0x16)
+
+    def test_level_frame_is_parsed_without_waiting_for_throttle(self):
+        """★ 真等级帧必须马上被解析，哪怕还在节流窗口内。
+
+        构造的数据流：3 帧"充电中标记" → **1 帧真等级** → 大量标记帧。
+        若没有"字节一变就解析"这条，那唯一一帧真等级会落在 0.25s 节流窗口里
+        被丢掉，之后全是标记帧（不带等级）→ 永远读不到 85%。
+        """
+        import time
+
+        from psbt.controllers import backend
+        from psbt.controllers.manager import ControllerManager, _Reader
+        from psbt.controllers.models import (FAMILY_DS4, ControllerView,
+                                            MutableController, Transport)
+
+        def frame(status):
+            return bytes([0x11, 0xC0, 0x00] + [0] * 29 + [status, 0x00]) + bytes(46)
+
+        stream = [frame(0x1B)] * 3 + [frame(0x08)] + [frame(0x1B)] * 100000
+
+        class _FakeHandle:
+            def __init__(self, info):
+                self.info = info
+                self.is_open = True
+                self._it = iter(stream)
+
+            def open(self):
+                return True
+
+            def read(self, size, timeout):
+                try:
+                    return next(self._it)
+                except StopIteration:
+                    time.sleep(0.05)
+                    return b""
+
+            def close(self):
+                self.is_open = False
+
+        manager = ControllerManager(Config())
+        view = ControllerView(
+            key="ds4", family=FAMILY_DS4, display_name="DualShock 4 (CUH-ZCT2)",
+            transport=Transport.BLUETOOTH, vendor_id=0x054C, product_id=0x09CC)
+        record = MutableController(view=view, candidate_paths=[b"fake"])
+        manager._records[view.key] = record               # noqa: SLF001
+
+        orig = backend.HidHandle
+        reader = None
+        try:
+            backend.HidHandle = _FakeHandle
+            reader = _Reader(manager, record)
+            reader.start()
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and record.view.battery.percent is None:
+                time.sleep(0.02)
+        finally:
+            if reader is not None:
+                reader.shutdown()
+            backend.HidHandle = orig
+        self.assertEqual(record.view.battery.percent, 85,
+                         "夹在节流窗口内的真等级帧不得被漏掉")
+
+
 class ReaderRobustnessTests(unittest.TestCase):
     """读取线程的日志辅助函数必须吃得下 hidapi 的 bytes 路径。"""
 
@@ -775,14 +1349,22 @@ class ReaderRobustnessTests(unittest.TestCase):
 
 
 class UnsupportedDeviceTests(unittest.TestCase):
-    """``supports_battery=False`` 必须在**解析入口**形成硬约束。
+    """只支持 PS4 / PS5 手柄**本体**。
 
-    历史 bug：DS3 / PS Move 在 registry 里 family 记的是 DS4，管理器中却
-    仍然无条件启动读取线程并按 DS4 解析。``supports_battery`` 当时只决定了
-    初始显示"未知" + 一句提示，**并没有阻止报告被解析** —— 一旦某条报告
-    恰好 report_id=0x01 且长度 ≥31，就会去读下标 30 那个无意义的位置，
-    读出假电量。约束放在 UI 提示上是不够的。
+    1.6 起移除了三类设备：PS3 的 DualShock 3、PS Move、以及 PS4 官方无线
+    适配器 (CUH-ZWA1)。前两者协议里根本没有电量字段（只能识别不能读），
+    适配器已停产且手头没有硬件可验证。
+
+    移除后，"识别但不读电量"那套分支（``supports_battery``）也随之删掉了，
+    所以这些 PID 现在**完全不会被识别**，不会出现在界面里。
     """
+
+    #: 明确不支持的设备（PID -> 说明）
+    REMOVED = (
+        (0x0268, "DualShock 3 (PS3)"),
+        (0x03D5, "PS Move 控制器"),
+        (0x0BA0, "DualShock 4 无线适配器 (CUH-ZWA1)"),
+    )
 
     def _info(self, product_id, name):
         from psbt.controllers.backend import HidDeviceInfo
@@ -790,40 +1372,47 @@ class UnsupportedDeviceTests(unittest.TestCase):
         return HidDeviceInfo(
             path=(r"\\?\hid#vid_054c&pid_%04x#fake" % product_id).encode(),
             vendor_id=0x054C, product_id=product_id, product_string=name,
-            usage_page=0, usage=0, interface_number=-1, bus_type=1,
+            usage_page=1, usage=5, interface_number=-1, bus_type=1,
         )
 
-    def test_registry_marks_legacy_devices_as_no_battery(self):
+    def test_registry_only_knows_ps4_and_ps5_controllers(self):
         from psbt.controllers import registry
 
-        for pid, label in ((0x0268, "DualShock 3"), (0x03D5, "PS Move")):
-            spec = registry.lookup(0x054C, pid)
-            self.assertIsNotNone(spec, label)
-            self.assertFalse(spec.supports_battery, "%s 不应支持电量" % label)
+        known = {pid for (_vid, pid) in registry.known_pairs()}
+        self.assertEqual(known, {0x05C4, 0x09CC, 0x0CE6, 0x0DF2},
+                         "只应保留 PS4/PS5 手柄本体")
 
-    def test_no_reader_started_for_unsupported_device(self):
+    def test_removed_devices_are_not_recognized(self):
+        from psbt.controllers import registry
+
+        for pid, label in self.REMOVED:
+            self.assertIsNone(registry.lookup(0x054C, pid),
+                              "%s 不应再被收录" % label)
+
+    def test_removed_device_is_not_tracked(self):
+        """不在表里的设备连识别都不会识别 —— 不进记录、不开线程。"""
         from psbt.controllers import backend
         from psbt.controllers.manager import ControllerManager
 
-        info = self._info(0x0268, "DualShock 3")
-        manager = ControllerManager(Config())
-        original = backend.all_candidates_for
-        try:
-            backend.all_candidates_for = lambda *a, **k: []
-            manager._add_device(info)                           # noqa: SLF001
-        finally:
-            backend.all_candidates_for = original
+        for pid, label in self.REMOVED:
+            info = self._info(pid, label)
+            manager = ControllerManager(Config())
+            manager._add_device(info)                             # noqa: SLF001
+            self.assertNotIn(info.device_key, manager._records,   # noqa: SLF001
+                             "%s 不应被跟踪" % label)
+            self.assertNotIn(info.device_key, manager._readers,   # noqa: SLF001
+                             "%s 不应启动读取线程" % label)
 
-        self.assertIn(info.device_key, manager._records,          # noqa: SLF001
-                      "不支持电量的设备仍应被识别并显示")
-        self.assertNotIn(info.device_key, manager._readers,       # noqa: SLF001
-                         "不得为它启动电量读取线程")
-        note = manager._records[info.device_key].view.note        # noqa: SLF001
-        self.assertIn("不提供电量", note)
-        manager._remove_device(info.device_key)                   # noqa: SLF001
+    def test_no_dead_supports_battery_field(self):
+        """护栏：那个已经没人用的 `supports_battery` 字段不该偷偷回来。"""
+        from psbt.controllers import registry
+
+        spec = registry.lookup(0x054C, 0x0CE6)
+        self.assertFalse(hasattr(spec, "supports_battery"),
+                         "字段已随设备精简一并删除")
 
     def test_reader_started_for_supported_device(self):
-        """对照组：支持电量的设备照常启动读取。"""
+        """对照：支持电量的设备照常启动读取。"""
         from psbt.controllers import backend
         from psbt.controllers.manager import ControllerManager
 

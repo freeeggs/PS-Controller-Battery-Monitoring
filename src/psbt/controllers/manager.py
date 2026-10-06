@@ -243,28 +243,17 @@ class ControllerManager:
             vendor_id=info.vendor_id,
             product_id=info.product_id,
             serial=info.serial,
-            battery=UNKNOWN_BATTERY if spec.supports_battery else BatteryReport(),
+            battery=UNKNOWN_BATTERY,
             connected=True,
-            note="" if spec.supports_battery else "该型号不提供电量数据",
         )
         record = MutableController(view=view, candidate_paths=[c.path for c in candidates])
         record.opened_ts = time.monotonic()
 
-        # ``supports_battery=False`` 的设备（DS3 / PS Move）只做识别与提示，
-        # **不启动电量读取线程**。不能在"UI 上标个未知"就算完：这些设备在
-        # registry 里记的 family 是 DS4，一旦某条报告恰好 report_id=0x01 且
-        # 长度 ≥31，就会被当成 DS4 报告去读下标 30 —— 那是无意义的位置，
-        # 会读出假电量。约束必须在解析入口，而不是界面提示。
-        reader = _Reader(self, record) if spec.supports_battery else None
+        reader = _Reader(self, record)
         with self._lock:
             self._records[record.view.key] = record
-            if reader is not None:
-                self._readers[record.view.key] = reader
-        if reader is not None:
-            reader.start()
-        else:
-            log.info("设备 %s 不提供电量数据：仅识别，不启动读取",
-                     view.display_name)
+            self._readers[record.view.key] = reader
+        reader.start()
 
         log.info(
             "检测到手柄：%s [%s / %s] 集合候选 %d 个",
@@ -310,6 +299,19 @@ class ControllerManager:
             old = record.view.battery
             old_note = record.view.note
             new_note = old_note if note is None else note
+
+            # 「正在充电，但这一帧没带电量」不覆盖已有读数。
+            #
+            # 真机场景（DS4 插上 USB）：手柄每秒几百帧地把 status[0] 报成
+            # 0x1B（插线 + 低 4 位 11），**这帧里没有真实等级**；真实的等级
+            # 只在充电器脉冲间隙那几帧（未插线、0x08）里出现。若照单全收，
+            # 界面就会在"未知"和真实等级之间疯狂跳动。
+            # 所以：保留上一次真实读到的等级，只更新充电状态。
+            if (battery.level is None and battery.percent is None
+                    and battery.state == ChargeState.CHARGING
+                    and old.level is not None):
+                battery = replace(battery, level=old.level, percent=old.percent)
+
             record.last_raw = raw
             record.view = replace(record.view, battery=battery, note=new_note)
             changed = (
@@ -365,6 +367,7 @@ class _Reader(threading.Thread):
         self._timeout = manager.config.read_timeout_ms
         self._error_limit = manager.config.read_error_limit
         self._minimal_reports = 0
+        self._last_status_byte: Optional[int] = None
 
     # -- 生命周期 --
     def shutdown(self) -> None:
@@ -418,12 +421,19 @@ class _Reader(threading.Thread):
             self.record.last_report_ts = time.monotonic()
 
             now = time.monotonic()
-            if (now - self.record.last_parse_ts) >= self._min_gap:
+            # 节流是为了省 CPU（蓝牙可达 250Hz），但**电量字段一变就必须立刻解析**，
+            # 否则会漏掉稍纵即逝的状态：实测 DS4 插线后每秒几百帧都报"充电中"标记，
+            # 真正的等级只在充电器脉冲间隙那几帧里出现（间隔几十秒、只持续几毫秒），
+            # 按 4Hz 节流很容易整段错过 → 充电期间一直显示"电量未知"。
+            # 探测只需读一个字节，开销可忽略。
+            status = parsers.peek_battery_byte(
+                self.record.view.family, self.record.view.transport, data)
+            due = (now - self.record.last_parse_ts) >= self._min_gap
+            if due or (status is not None and status != self._last_status_byte):
+                self._last_status_byte = status
                 self.record.last_parse_ts = now
                 self._parse(data)
             else:
-                # 手柄（尤其蓝牙）报告速率可达 250Hz，节流到 ~4Hz 足够，
-                # 又不至于让 Python 层空转。
                 self._stop.wait(self._min_gap)
 
     # -- HID 打开 / 轮换集合 --
@@ -577,12 +587,20 @@ def _short(key) -> str:
     ``TypeError: a bytes-like object is required, not 'str'``：
     "所有集合都打不开"这条**本该只记日志并退避重试**的路径，实际结果是
     读取线程直接崩掉，那台手柄从此不再被读取。
+
+    key 现在有两种形态：
+    ``054C:09CC#8&2657b139&0&0000``（HID 实例段）
+    ``054C:0CE6#USB\\VID_054C&PID_0CE6\\1C784B8B409B0000``（物理设备 ID）
+    两者都取**最后一段**最有信息量的部分。
     """
     if isinstance(key, (bytes, bytearray)):
         key = key.decode("utf-8", "replace")
     else:
         key = str(key)
-    return key.split("#")[-1][:8] if "#" in key else key[:8]
+    tail = key.split("#")[-1]
+    if "\\" in tail:
+        tail = tail.split("\\")[-1]
+    return tail[:8]
 
 
 def lowest_battery_view(views: List[ControllerView]) -> Optional[ControllerView]:
