@@ -31,6 +31,7 @@ class Config:
     scan_interval_idle: float = 5.0      # 无手柄时的设备枚举间隔（秒）
     scan_interval_active: float = 3.0    # 有手柄时的设备枚举间隔（秒）
     report_min_gap: float = 0.25         # 同一手柄两次解析的最小间隔（秒）,节流上限 4Hz
+    settle_seconds: float = 5.0          # 刚连接/重连后的"稳定等待"：这段时间内的电量读数一律不采信（0=关闭）
     read_timeout_ms: int = 1000          # 单次 HID 读超时
     read_error_limit: int = 5            # 连续读失败多少次后判定为不可读
 
@@ -59,6 +60,7 @@ class Config:
         self.scan_interval_idle = _clamp_float(self.scan_interval_idle, 1.0, 120.0, 5.0)
         self.scan_interval_active = _clamp_float(self.scan_interval_active, 1.0, 120.0, 3.0)
         self.report_min_gap = _clamp_float(self.report_min_gap, 0.05, 5.0, 0.25)
+        self.settle_seconds = _clamp_float(self.settle_seconds, 0.0, 60.0, 5.0)
         self.read_timeout_ms = int(_clamp_float(self.read_timeout_ms, 100, 10000, 1000))
         self.read_error_limit = int(_clamp_float(self.read_error_limit, 1, 100, 5))
 

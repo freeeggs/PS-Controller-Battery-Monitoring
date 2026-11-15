@@ -95,7 +95,6 @@ class Application:
                 get_views=lambda: self._manager.snapshot() if self._manager else [],
                 on_rescan=self._on_rescan,
                 on_quit=self.shutdown,
-                on_show_info=self._show_status_popup,
                 on_about=self._show_about,
                 on_open_logs=lambda: winapi.open_in_explorer(paths.log_dir()),
             ),
@@ -146,7 +145,7 @@ class Application:
         self._popup.start()
         self._start_watchdog()
         self._tray.refresh_now()
-        log.info("后台服务已就绪（双击托盘图标或右键查看详情）")
+        log.info("后台服务已就绪（鼠标悬停图标看电量，右键查看更多）")
 
     def _start_watchdog(self) -> None:
         if self._watchdog and self._watchdog.is_alive():
@@ -222,41 +221,6 @@ class Application:
 
     def _views(self) -> List[ControllerView]:
         return self._manager.snapshot() if self._manager else []
-
-    def _show_status_popup(self) -> None:
-        views = self._views()
-        if not views:
-            body = ("未检测到手柄。\n\n"
-                    "请确认手柄已通过 USB 或蓝牙连接，并且已被 Windows 识别为"
-                    "「Wireless Controller / DualSense Wireless Controller」。")
-            title = "PS 手柄电量监视器"
-            severity = "info"
-        else:
-            lines = []
-            for view in views:
-                line = "%s：%s（%s，%s）" % (
-                    view.short_name, view.battery.percent_text,
-                    view.battery.level_text, view.transport.label,
-                )
-                if view.battery.state.is_charging:
-                    line += " · %s" % view.battery.state.label
-                if view.note:
-                    line += "\n    ⚠ %s" % view.note
-                lines.append(line)
-            lowest = min((v for v in views if v.percent is not None),
-                         key=lambda v: v.percent, default=None)
-            if lowest is not None and len(views) > 1:
-                lines.append("")
-                lines.append("托盘图标显示电量最低的手柄：%s" % lowest.short_name)
-            lines.append("")
-            lines.append("说明：PS4/PS5 手柄 API 只有约 10 档电量，"
-                         "百分比为区间估算值，不是 1% 精度。")
-            title = "已连接 %d 台手柄" % len(views)
-            body = "\n".join(lines)
-            severity = "info"
-
-        if self._popup is None or not self._popup.show(title, body, severity, 14):
-            winapi.message_box(body, title)
 
     def _show_about(self) -> None:
         extra = []

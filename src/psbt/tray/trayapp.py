@@ -47,7 +47,6 @@ class TrayCallbacks:
     get_views: Callable[[], List[ControllerView]] = lambda: []
     on_rescan: Callable[[], None] = lambda: None
     on_quit: Callable[[], None] = lambda: None
-    on_show_info: Callable[[], None] = lambda: None
     on_about: Callable[[], None] = lambda: None
     on_open_logs: Callable[[], None] = lambda: None
 
@@ -330,7 +329,7 @@ class TrayApp:
     def _menu_items(self):
         views = self.current_views()
 
-        yield pystray.MenuItem(self._status_header(views), self._on_info_clicked, default=True)
+        yield pystray.MenuItem(self._status_header(views), self._on_refresh, default=True)
         yield pystray.MenuItem("—— 已连接手柄 ——", None)
         if views:
             for view in views:
@@ -346,7 +345,7 @@ class TrayApp:
                                checked=lambda item: self.autostart_enabled())
         yield pystray.MenuItem("图标风格", pystray.Menu(*self._style_items()))
         yield pystray.Menu.SEPARATOR
-        yield pystray.MenuItem("刷新状态并查看详情", self._on_info_clicked)
+        yield pystray.MenuItem("刷新状态", self._on_refresh)
         yield pystray.MenuItem("打开日志目录", self._on_open_logs)
         yield pystray.MenuItem("关于", self._on_about)
         yield pystray.Menu.SEPARATOR
@@ -401,15 +400,16 @@ class TrayApp:
     # ------------------------------------------------------------------
     # 菜单动作
     # ------------------------------------------------------------------
-    def _on_info_clicked(self, icon=None, item=None) -> None:
+    def _on_refresh(self, icon=None, item=None) -> None:
+        """左键单击 / 菜单里的「刷新状态」：只刷新，不弹窗。
+
+        电量细节已经在**鼠标悬停提示**里了（tooltip），左键再弹一个悬浮窗
+        属于重复信息，1.9 起删掉。
+        """
         try:
             self.cb.on_rescan()
         except Exception:
             log.exception("刷新状态失败")
-        try:
-            self.cb.on_show_info()
-        except Exception:
-            log.exception("显示详情失败")
 
     def _toggle_autostart(self, icon=None, item=None) -> None:
         target = not self.autostart_enabled()

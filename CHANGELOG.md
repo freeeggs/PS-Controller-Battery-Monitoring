@@ -1,9 +1,9 @@
 # 更新记录 / Changelog
 
-本文件记录 **1.4 → 1.8** 的变更。逐条中英对照，完整细节（含真机字节证据）
+本文件记录 **1.4 → 1.9** 的变更。逐条中英对照，完整细节（含真机字节证据）
 见 [`docs/USAGE.md` 版本历史](docs/USAGE.md#版本历史)。
 
-This file covers releases **1.4 → 1.8**, in Chinese/English pairs. Full details
+This file covers releases **1.4 → 1.9**, in Chinese/English pairs. Full details
 (including raw on-device byte evidence) are in
 [`docs/USAGE.md`](docs/USAGE.md#版本历史).
 
@@ -15,6 +15,22 @@ This file covers releases **1.4 → 1.8**, in Chinese/English pairs. Full detail
 > doc (the Linux kernel) turned out to be wrong on real hardware.
 
 ---
+
+## 1.9 — 2026-11-15
+
+**中文**：删掉左键的详情悬浮窗（与悬停提示重复）；新增连接/断开后的"稳定等待"，
+挡住偶发的假电量。
+
+**English**: Removed the left-click details window (redundant with the tooltip);
+added a settle window after connect/disconnect to block occasional false readings.
+
+- 左键单击**只刷新**，不再弹窗；菜单「刷新状态并查看详情」→「刷新状态」。
+  *Left-click now only refreshes, no window; menu item renamed to "Refresh".*
+- 新增 `settle_seconds`（默认 5 秒）：刚连接/重连的头几秒不采信电量读数，
+  之后正常显示；`0` 关闭。
+  *New `settle_seconds` (default 5 s): battery readings are ignored for a few seconds after connect/reconnect; set `0` to disable.*
+- 单元测试 156 → **162**。
+  *Unit tests: 156 → 162.*
 
 ## 1.8 — 2026-10-05
 

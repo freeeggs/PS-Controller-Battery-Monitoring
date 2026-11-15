@@ -289,13 +289,23 @@ class ConfigTests(unittest.TestCase):
         cfg = Config()
         cfg.scan_interval_idle = -5
         cfg.report_min_gap = "abc"
+        cfg.settle_seconds = -3
         cfg.log_level = "chatty"
         cfg.alert_popup = "sometimes"
         cfg = cfg.normalized()
         self.assertGreater(cfg.scan_interval_idle, 0)
         self.assertGreater(cfg.report_min_gap, 0)
+        self.assertEqual(cfg.settle_seconds, 0.0, "负值收敛为 0（=关闭）")
         self.assertEqual(cfg.log_level, "INFO")
         self.assertEqual(cfg.alert_popup, "auto")
+
+    def test_settle_seconds_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            cfg = Config()
+            cfg.settle_seconds = 12.0
+            self.assertTrue(cfg.save(path))
+            self.assertEqual(Config.load(path).settle_seconds, 12.0)
 
     def test_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1325,6 +1335,153 @@ class ParseThrottleTests(unittest.TestCase):
             backend.HidHandle = orig
         self.assertEqual(record.view.battery.percent, 85,
                          "夹在节流窗口内的真等级帧不得被漏掉")
+
+
+class SettleWindowTests(unittest.TestCase):
+    """刚连接 / 重连后的头几秒不采信电量，过了再显示。
+
+    用户要求："手柄刚连接和断开连接的那几秒忽略电量信息…等几秒之后再显示电量"。
+
+    这是与协议无关的**最后一道闸**：连接/断开瞬间，不同固件仍可能发出
+    空壳报告（本项目已按报告体特征挡掉大部分，但无法穷尽），
+    读出来可能就是假的 5% / 100%，还会误触发一次低电量提醒。
+    """
+
+    def _record(self, settle_until):
+        from psbt.controllers.models import (
+            FAMILY_DUALSENSE, MutableController, ControllerView, Transport)
+
+        view = ControllerView(
+            key="k", family=FAMILY_DUALSENSE, display_name="DualSense",
+            transport=Transport.USB, vendor_id=0x054C, product_id=0x0CE6)
+        return MutableController(view=view, candidate_paths=[b"x"],
+                                 settle_until=settle_until)
+
+    def _reader(self, record):
+        from psbt.controllers.manager import ControllerManager, _Reader
+
+        manager = ControllerManager(Config())
+        manager._records[record.view.key] = record        # noqa: SLF001
+        return _Reader(manager, record)
+
+    @staticmethod
+    def _frame(level_byte):
+        """一帧看起来完全正常的 DualSense USB 报告（电量字节 = level_byte）。"""
+        buf = bytearray(64)
+        buf[0] = 0x01
+        for i in range(12, 24):
+            buf[i] = 0x80
+        buf[53] = level_byte
+        return bytes(buf)
+
+    def test_readings_ignored_during_settle_window(self):
+        """稳定期内：假的 5% 不会进入界面。"""
+        import time
+
+        record = self._record(settle_until=time.monotonic() + 5.0)
+        reader = self._reader(record)
+        reader._parse(self._frame(0x00))                  # noqa: SLF001  假的 0 档
+        self.assertIsNone(record.view.percent, "稳定期内不得显示任何电量")
+        self.assertIsNone(record.view.battery.level)
+
+    def test_readings_accepted_after_settle_window(self):
+        """稳定期过后：正常显示。"""
+        record = self._record(settle_until=0.0)
+        reader = self._reader(record)
+        reader._parse(self._frame(0x08))                  # noqa: SLF001
+        self.assertEqual(record.view.percent, 85)
+
+    def test_note_updates_are_not_blocked(self):
+        """稳定期只挡电量读数，不能连"无法打开设备"这类提示也挡掉。"""
+        import time
+
+        from psbt.controllers.models import UNKNOWN_BATTERY
+
+        record = self._record(settle_until=time.monotonic() + 5.0)
+        manager = self._reader(record).manager
+
+        manager._update_note(record.view.key, "无法打开 HID 设备")   # noqa: SLF001
+        self.assertIn("无法打开", record.view.note)
+        self.assertIs(record.view.battery, UNKNOWN_BATTERY)
+
+    def test_add_device_sets_settle_deadline(self):
+        """连接设备时按配置写入稳定期截止时刻。"""
+        import time
+
+        from psbt.controllers import backend
+        from psbt.controllers.manager import ControllerManager
+
+        cfg = Config()
+        cfg.settle_seconds = 7.0
+        manager = ControllerManager(cfg)
+        info = backend.HidDeviceInfo(
+            path=b"\\\\?\\HID#VID_054C&PID_0CE6&MI_03#fake#{}",
+            vendor_id=0x054C, product_id=0x0CE6, product_string="DualSense",
+            usage_page=1, usage=5, interface_number=-1, bus_type=1)
+
+        orig_cand, orig_handle = backend.all_candidates_for, backend.HidHandle
+
+        class _NeverOpen:
+            def __init__(self, info):
+                self.info = info
+
+            def open(self):
+                return False
+
+            def close(self):
+                pass
+
+        try:
+            backend.all_candidates_for = lambda *a, **k: [info]
+            backend.HidHandle = _NeverOpen
+            before = time.monotonic()
+            manager._add_device(info)                     # noqa: SLF001
+            record = manager._records[info.device_key]     # noqa: SLF001
+            delta = record.settle_until - before
+            self.assertGreaterEqual(delta, 6.5, "稳定期约为 7 秒")
+            self.assertLessEqual(delta, 8.0)
+        finally:
+            backend.all_candidates_for = orig_cand
+            backend.HidHandle = orig_handle
+            manager.stop()
+
+    def test_settle_zero_disables_the_window(self):
+        """settle_seconds = 0 时立即采信（想关掉这道闸的人能关掉）。"""
+        import time
+
+        from psbt.controllers import backend
+        from psbt.controllers.manager import ControllerManager
+
+        cfg = Config()
+        cfg.settle_seconds = 0.0
+        manager = ControllerManager(cfg)
+        info = backend.HidDeviceInfo(
+            path=b"\\\\?\\HID#VID_054C&PID_0CE6&MI_03#fake#{}",
+            vendor_id=0x054C, product_id=0x0CE6, product_string="DualSense",
+            usage_page=1, usage=5, interface_number=-1, bus_type=1)
+
+        orig_cand, orig_handle = backend.all_candidates_for, backend.HidHandle
+
+        class _NeverOpen:
+            def __init__(self, info):
+                self.info = info
+
+            def open(self):
+                return False
+
+            def close(self):
+                pass
+
+        try:
+            backend.all_candidates_for = lambda *a, **k: [info]
+            backend.HidHandle = _NeverOpen
+            manager._add_device(info)                     # noqa: SLF001
+            record = manager._records[info.device_key]     # noqa: SLF001
+            self.assertLessEqual(record.settle_until, time.monotonic() + 0.01)
+        finally:
+            backend.all_candidates_for = orig_cand
+            backend.HidHandle = orig_handle
+            manager.stop()
 
 
 class ReaderRobustnessTests(unittest.TestCase):

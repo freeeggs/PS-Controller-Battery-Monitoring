@@ -169,6 +169,8 @@ class MutableController:
     last_raw: bytes = b""
     tried_full_mode: bool = False
     opened_ts: float = 0.0
+    #: 在这个时刻之前不采信任何电量读数（刚连接/重连时的稳定期）
+    settle_until: float = 0.0
 
     @property
     def current_path(self) -> bytes:

@@ -248,6 +248,13 @@ class ControllerManager:
         )
         record = MutableController(view=view, candidate_paths=[c.path for c in candidates])
         record.opened_ts = time.monotonic()
+        # 稳定等待：刚连接（含断开后重连、走线变化）的头几秒不采信电量读数。
+        #
+        # 连接/断开的瞬间，手柄常会先发一两条"空壳"或状态未就绪的报告
+        # （本项目已按报告体特征挡掉大部分，但不同固件仍有漏网），
+        # 读出来就是假的 5% / 100% 并可能误触发一次低电量提醒。
+        # 这里再加一道与协议无关的时间闸：等几秒再显示电量。
+        record.settle_until = record.opened_ts + max(0.0, self.config.settle_seconds)
 
         reader = _Reader(self, record)
         with self._lock:
@@ -506,6 +513,15 @@ class _Reader(threading.Thread):
             return
 
         self._minimal_reports = 0
+
+        # 稳定等待：刚连接/重连的头几秒不采信电量（见 _add_device 的说明）。
+        # 注意只挡住"电量读数"，下面的状态/提示（note）改动不受影响 ——
+        # 否则"无法打开 HID 设备"这类提示在稳定期内会显示不出来。
+        if time.monotonic() < self.record.settle_until:
+            log.debug("刚连接，忽略本次电量读数（%s 之前不采信）：level=%s percent=%s",
+                      _short(view.key), report.level, report.percent)
+            return
+
         self.manager._update_battery(  # noqa: SLF001 - 同包内协作
             view.key, report, data, note=""
         )

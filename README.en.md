@@ -49,8 +49,9 @@ If SmartScreen blocks it (the binary is unsigned), click *More info → Run anyw
 
 ## Usage
 
-**Right-click** the tray icon for per-controller levels, autostart, icon style,
-log folder and exit. **Left-click** for a details window.
+**Hover** the tray icon to see per-controller levels.
+**Right-click** for refresh, autostart, icon style, log folder and exit.
+**Left-click** only refreshes — the details window was removed (the tooltip already shows the same).
 
 ## Command line
 
